@@ -1,0 +1,18 @@
+id = "midnight-green"
+name = "Midnight Green"
+version = "0.1.0"
+description = "A calm dark community theme example."
+authors = ["Alloy Community"]
+mode = "dark"
+
+[colors]
+background = "#0c1110"
+surface = "#121918"
+surface-muted = "#1d2927"
+panel = "#17211f"
+text = "#f1f7f3"
+muted-text = "#9fb0aa"
+accent = "#7bd8a4"
+accent-text = "#06120c"
+hover = "#24332f"
+danger = "#ef6f75"

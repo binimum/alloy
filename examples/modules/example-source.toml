@@ -1,0 +1,8 @@
+id = "community.sources.example"
+name = "Example Source"
+version = "0.1.0"
+category = "music-source"
+description = "A manifest-only community source module example."
+authors = ["Alloy Community"]
+enabled_by_default = false
+capabilities = ["network-source", "playlist-import"]
