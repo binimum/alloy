@@ -1,17 +1,20 @@
-use crate::audio::{AudioEngine, EqProcessorFactory, PlaybackState, SampleBlockProcessorFactory};
+use crate::audio::{
+    AudioEngine, EqProcessorFactory, PlaybackState, ReplayGainProcessorFactory,
+    SampleBlockProcessorFactory,
+};
 use crate::config::{
     self, AppConfig, AppPaths, DISCORD_MODULE_ID, EQ_MODULE_ID, LASTFM_MODULE_ID,
-    LOCAL_SOURCE_MODULE_ID,
+    LOCAL_SOURCE_MODULE_ID, REPLAYGAIN_MODULE_ID, RepeatMode, ReplayGainMode,
 };
 use crate::integrations::IntegrationManager;
 use crate::library::{LocalMusicSource, format_duration, tracks_from_drop};
 use crate::plugins::{DiscoveredModuleKind, PluginHost};
-use crate::theme::{AlloyTheme, ThemeCatalog, ThemeColors, apply_theme};
+use crate::theme::{AlloyTheme, ThemeCatalog, ThemeColors, apply_theme, configure_fonts};
 use alloy_core::{ModuleCategory, ModuleEvent, MusicSourceModule, Track};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct AlloyApp {
     paths: AppPaths,
@@ -33,6 +36,7 @@ pub struct AlloyApp {
     config_text: String,
     config_text_dirty: bool,
     settings_error: Option<String>,
+    selected_chain_node: Option<String>,
     cover_cache: BTreeMap<PathBuf, Option<egui::TextureHandle>>,
 }
 
@@ -52,6 +56,9 @@ enum TransportIcon {
     Pause,
     Next,
     Stop,
+    Shuffle,
+    Repeat,
+    RepeatOne,
 }
 
 impl AlloyApp {
@@ -60,15 +67,20 @@ impl AlloyApp {
         let mut config = AppConfig::load(&paths)?;
         config.discord = config.discord.clone().with_env();
         config::apply_cli_library_paths(&mut config);
+        let mut config_changed = false;
 
         let themes = ThemeCatalog::load(&paths.themes_dir);
+        if themes.find(&config.active_theme).is_none() {
+            config.active_theme = themes.default_theme().definition.id.clone();
+            config_changed = true;
+        }
         let active_theme = themes
             .find(&config.active_theme)
             .unwrap_or_else(|| themes.default_theme());
+        configure_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, active_theme);
 
         let plugins = PluginHost::load(&paths.modules_dir);
-        let mut config_changed = false;
         for module in plugins.modules() {
             config_changed |= config
                 .ensure_module_toggle(&module.manifest.id, module.manifest.enabled_by_default);
@@ -123,6 +135,7 @@ impl AlloyApp {
             config_text,
             config_text_dirty: false,
             settings_error: None,
+            selected_chain_node: Some(REPLAYGAIN_MODULE_ID.to_owned()),
             cover_cache: BTreeMap::new(),
         })
     }
@@ -234,6 +247,38 @@ impl AlloyApp {
         }
     }
 
+    fn pick_library_folder(&mut self) {
+        match crate::native_file_dialog::pick_folder("Choose a music folder") {
+            Ok(Some(path)) => {
+                config::push_unique_path(&mut self.config.library_paths, path);
+                self.save_config();
+                self.rescan_library();
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status_line = err;
+            }
+        }
+    }
+
+    fn pick_library_files(&mut self) {
+        match crate::native_file_dialog::pick_audio_files("Choose music files") {
+            Ok(paths) => {
+                if paths.is_empty() {
+                    return;
+                }
+                for path in paths {
+                    config::push_unique_path(&mut self.config.library_paths, path);
+                }
+                self.save_config();
+                self.rescan_library();
+            }
+            Err(err) => {
+                self.status_line = err;
+            }
+        }
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if dropped.is_empty() {
@@ -277,7 +322,7 @@ impl AlloyApp {
 
         self.integrations
             .dispatch(&ModuleEvent::TrackFinished { track });
-        self.play_next();
+        self.advance_after_finished();
     }
 
     fn dispatch_position_event(&mut self) {
@@ -304,7 +349,8 @@ impl AlloyApp {
         };
         self.selected_track = Some(index);
 
-        let processor_factories = self.audio_processor_factories();
+        let processor_factories = self.audio_processor_factories_for_track(&track);
+        let bit_perfect = self.config.playback.bit_perfect;
         let Some(audio) = &mut self.audio else {
             self.status_line = self
                 .audio_error
@@ -313,9 +359,9 @@ impl AlloyApp {
             return;
         };
 
-        match audio.play(track.clone(), processor_factories) {
+        match audio.play(track.clone(), processor_factories, bit_perfect) {
             Ok(()) => {
-                self.status_line = format!("Playing {}", track.title);
+                self.status_line = "Playback started".to_owned();
                 self.integrations
                     .dispatch(&ModuleEvent::PlaybackStarted { track });
             }
@@ -329,9 +375,12 @@ impl AlloyApp {
         if self.library.is_empty() {
             return;
         }
-        let next = self
-            .current_index()
-            .map_or(0, |index| (index + 1) % self.library.len());
+        let next = if self.config.playback.shuffle {
+            self.shuffled_index()
+        } else {
+            self.current_index()
+                .map_or(0, |index| (index + 1) % self.library.len())
+        };
         self.play_index(next);
     }
 
@@ -347,6 +396,63 @@ impl AlloyApp {
             }
         });
         self.play_index(previous);
+    }
+
+    fn rewind_or_previous(&mut self) {
+        let position = self
+            .audio
+            .as_ref()
+            .map_or(Duration::ZERO, AudioEngine::position);
+        if position > Duration::from_secs(3) {
+            self.seek_to_position(Duration::ZERO);
+            return;
+        }
+
+        self.play_previous();
+    }
+
+    fn advance_after_finished(&mut self) {
+        if self.library.is_empty() {
+            return;
+        }
+
+        if self.config.playback.repeat == RepeatMode::One {
+            if let Some(index) = self.selected_track {
+                self.play_index(index);
+            }
+            return;
+        }
+
+        if self.config.playback.shuffle {
+            self.play_index(self.shuffled_index());
+            return;
+        }
+
+        let current = self.selected_track.unwrap_or(0);
+        if current + 1 < self.library.len() {
+            self.play_index(current + 1);
+        } else if self.config.playback.repeat == RepeatMode::All {
+            self.play_index(0);
+        } else {
+            self.status_line = "Playback finished".to_owned();
+        }
+    }
+
+    fn shuffled_index(&self) -> usize {
+        let len = self.library.len();
+        if len <= 1 {
+            return 0;
+        }
+
+        let current = self.current_index().unwrap_or(0);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.subsec_nanos() as usize);
+        let mut next = seed % len;
+        if next == current {
+            next = (next + 1) % len;
+        }
+        next
     }
 
     fn toggle_playback(&mut self) {
@@ -395,12 +501,13 @@ impl AlloyApp {
             return;
         };
 
-        let processor_factories = self.audio_processor_factories();
+        let processor_factories = self.audio_processor_factories_for_track(&track);
+        let bit_perfect = self.config.playback.bit_perfect;
         let Some(audio) = &mut self.audio else {
             return;
         };
-        if let Err(err) = audio.play_from(track, position, processor_factories) {
-            self.status_line = format!("Could not apply EQ: {err}");
+        if let Err(err) = audio.play_from(track, position, processor_factories, bit_perfect) {
+            self.status_line = format!("Could not apply audio chain: {err}");
         }
     }
 
@@ -414,17 +521,39 @@ impl AlloyApp {
             return;
         };
         let target = duration.mul_f32(fraction.clamp(0.0, 1.0));
+        self.seek_to_position_for_track(track, target);
+    }
 
-        let processor_factories = self.audio_processor_factories();
+    fn seek_to_position(&mut self, target: Duration) {
+        let Some(track) = self
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.current_track().cloned())
+        else {
+            return;
+        };
+        self.seek_to_position_for_track(track, target);
+    }
+
+    fn seek_to_position_for_track(&mut self, track: Track, target: Duration) {
+        let processor_factories = self.audio_processor_factories_for_track(&track);
+        let bit_perfect = self.config.playback.bit_perfect;
         let Some(audio) = &mut self.audio else {
             return;
         };
-        if let Err(err) = audio.play_from(track, target, processor_factories) {
+        if let Err(err) = audio.play_from(track, target, processor_factories, bit_perfect) {
             self.status_line = format!("Seek failed: {err}");
         }
     }
 
-    fn audio_processor_factories(&self) -> Vec<Box<dyn SampleBlockProcessorFactory>> {
+    fn audio_processor_factories_for_track(
+        &self,
+        track: &Track,
+    ) -> Vec<Box<dyn SampleBlockProcessorFactory>> {
+        if self.config.playback.bit_perfect {
+            return Vec::new();
+        }
+
         let mut factories: Vec<Box<dyn SampleBlockProcessorFactory>> = Vec::new();
 
         for node in &self.config.audio_chain {
@@ -432,7 +561,12 @@ impl AlloyApp {
                 continue;
             }
 
-            if node.id == EQ_MODULE_ID {
+            if node.id == REPLAYGAIN_MODULE_ID {
+                let profile = self.config.replay_gain_profile(track);
+                if profile.enabled {
+                    factories.push(Box::new(ReplayGainProcessorFactory::new(profile)));
+                }
+            } else if node.id == EQ_MODULE_ID {
                 let profile = self.config.eq_profile();
                 if profile.enabled {
                     factories.push(Box::new(EqProcessorFactory::new(profile)));
@@ -446,7 +580,10 @@ impl AlloyApp {
     }
 
     fn available_processors(&self) -> Vec<(String, String)> {
-        let mut processors = vec![(EQ_MODULE_ID.to_owned(), "Equalizer".to_owned())];
+        let mut processors = vec![
+            (REPLAYGAIN_MODULE_ID.to_owned(), "ReplayGain".to_owned()),
+            (EQ_MODULE_ID.to_owned(), "Equalizer".to_owned()),
+        ];
         processors.extend(
             self.plugins
                 .modules()
@@ -458,6 +595,10 @@ impl AlloyApp {
     }
 
     fn processor_label(&self, id: &str) -> String {
+        if id == REPLAYGAIN_MODULE_ID {
+            return "ReplayGain".to_owned();
+        }
+
         if id == EQ_MODULE_ID {
             return "Equalizer".to_owned();
         }
@@ -583,13 +724,14 @@ impl AlloyApp {
 
         ui.add_space(10.0);
         let mut changed = false;
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.config.volume, 0.0..=1.5)
-                    .text("Default volume")
-                    .show_value(true),
-            )
-            .changed();
+        changed |= thin_slider(
+            ui,
+            egui::Slider::new(&mut self.config.volume, 0.0..=1.5)
+                .text("Default volume")
+                .show_value(true),
+            360.0,
+        )
+        .changed();
         if changed {
             if let Some(audio) = &mut self.audio {
                 audio.set_volume(self.config.volume);
@@ -631,46 +773,140 @@ impl AlloyApp {
             if ui.button("Add").clicked() {
                 self.add_path_from_entry();
             }
+            if ui.button("Choose Folder...").clicked() {
+                self.pick_library_folder();
+            }
+            if ui.button("Choose Files...").clicked() {
+                self.pick_library_files();
+            }
         });
     }
 
     fn settings_audio_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Audio Chain");
-        ui.label("Processors run from top to bottom when playback starts.");
+        let mut playback_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            playback_changed |= ui
+                .checkbox(&mut self.config.playback.bit_perfect, "Bit-perfect")
+                .changed();
+            playback_changed |= ui
+                .checkbox(&mut self.config.playback.shuffle, "Shuffle")
+                .changed();
+            ui.label("Repeat");
+            egui::ComboBox::from_id_salt("repeat-mode")
+                .selected_text(match self.config.playback.repeat {
+                    RepeatMode::None => "Off",
+                    RepeatMode::All => "All",
+                    RepeatMode::One => "One",
+                })
+                .show_ui(ui, |ui| {
+                    playback_changed |= ui
+                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::None, "Off")
+                        .changed();
+                    playback_changed |= ui
+                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::All, "All")
+                        .changed();
+                    playback_changed |= ui
+                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::One, "One")
+                        .changed();
+                });
+        });
+        if playback_changed {
+            self.save_config();
+            self.status_line = "Playback settings saved".to_owned();
+        }
+        ui.separator();
+        ui.label("Processors run left to right when playback starts.");
         ui.add_space(8.0);
         self.audio_chain_ui(ui);
-
-        ui.separator();
-        self.equalizer_ui(ui);
     }
 
     fn audio_chain_ui(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
+        if self.selected_chain_node.as_ref().is_none_or(|selected| {
+            !self
+                .config
+                .audio_chain
+                .iter()
+                .any(|node| node.id == *selected)
+        }) {
+            self.selected_chain_node = self.config.audio_chain.first().map(|node| node.id.clone());
+        }
+
         let chain = self.config.audio_chain.clone();
-        for (index, node) in chain.iter().enumerate() {
-            let label = self.processor_label(&node.id);
-            ui.horizontal(|ui| {
-                let mut enabled = node.enabled;
-                if ui.checkbox(&mut enabled, "").changed() {
-                    if let Some(config_node) = self.config.audio_chain.get_mut(index) {
-                        config_node.enabled = enabled;
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    for (index, node) in chain.iter().enumerate() {
+                        let label = self.processor_label(&node.id);
+                        let selected =
+                            self.selected_chain_node.as_deref() == Some(node.id.as_str());
+                        let text = if node.enabled {
+                            label
+                        } else {
+                            format!("{label} (off)")
+                        };
+                        if ui
+                            .add_sized([142.0, 38.0], egui::Button::selectable(selected, text))
+                            .on_hover_text(&node.id)
+                            .clicked()
+                        {
+                            self.selected_chain_node = Some(node.id.clone());
+                        }
+
+                        if index + 1 < chain.len() {
+                            ui.label(egui::RichText::new("->").strong());
+                        }
+                    }
+                });
+            });
+
+        ui.add_space(10.0);
+        let selected_id = self.selected_chain_node.clone();
+        if let Some(selected_id) = selected_id {
+            if let Some(index) = self
+                .config
+                .audio_chain
+                .iter()
+                .position(|node| node.id == selected_id)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(self.processor_label(&selected_id)).strong());
+                    let mut enabled = self.config.audio_chain[index].enabled;
+                    if ui.checkbox(&mut enabled, "Enabled").changed() {
+                        self.config.audio_chain[index].enabled = enabled;
                         changed = true;
                     }
+                    if ui.button("Move Left").clicked() && index > 0 {
+                        self.config.audio_chain.swap(index, index - 1);
+                        changed = true;
+                    }
+                    if ui.button("Move Right").clicked()
+                        && index + 1 < self.config.audio_chain.len()
+                    {
+                        self.config.audio_chain.swap(index, index + 1);
+                        changed = true;
+                    }
+                    if selected_id != EQ_MODULE_ID
+                        && selected_id != REPLAYGAIN_MODULE_ID
+                        && ui.button("Remove").clicked()
+                    {
+                        self.config.audio_chain.remove(index);
+                        self.selected_chain_node =
+                            self.config.audio_chain.first().map(|node| node.id.clone());
+                        changed = true;
+                    }
+                });
+                ui.add_space(8.0);
+                if selected_id == REPLAYGAIN_MODULE_ID {
+                    self.replay_gain_ui(ui);
+                } else if selected_id == EQ_MODULE_ID {
+                    self.equalizer_ui(ui);
+                } else {
+                    ui.label(selected_id);
                 }
-                ui.label(label).on_hover_text(&node.id);
-                if ui.button("Up").clicked() && index > 0 {
-                    self.config.audio_chain.swap(index, index - 1);
-                    changed = true;
-                }
-                if ui.button("Down").clicked() && index + 1 < self.config.audio_chain.len() {
-                    self.config.audio_chain.swap(index, index + 1);
-                    changed = true;
-                }
-                if node.id != EQ_MODULE_ID && ui.button("Remove").clicked() {
-                    self.config.audio_chain.remove(index);
-                    changed = true;
-                }
-            });
+            }
         }
 
         let available = self
@@ -680,15 +916,17 @@ impl AlloyApp {
             .collect::<Vec<_>>();
 
         if !available.is_empty() {
-            ui.add_space(8.0);
+            ui.separator();
             ui.label(egui::RichText::new("Available Processors").strong());
             for (id, name) in available {
                 ui.horizontal(|ui| {
                     ui.label(name);
                     if ui.button("Add").clicked() {
-                        self.config
-                            .audio_chain
-                            .push(config::AudioChainNodeConfig { id, enabled: true });
+                        self.config.audio_chain.push(config::AudioChainNodeConfig {
+                            id: id.clone(),
+                            enabled: true,
+                        });
+                        self.selected_chain_node = Some(id);
                         changed = true;
                     }
                 });
@@ -729,6 +967,7 @@ impl AlloyApp {
     fn settings_modules_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Modules");
         self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
+        self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
         self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
         self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
         self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
@@ -776,63 +1015,78 @@ impl AlloyApp {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let colors = self.active_colors();
-        ui.add_space(6.0);
-        ui.heading(egui::RichText::new("Alloy").size(28.0).color(colors.text));
-        ui.label(egui::RichText::new("Modular Rust music").color(colors.muted_text));
-        ui.add_space(14.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.heading(egui::RichText::new("Alloy").size(28.0).color(colors.text));
+                ui.label(egui::RichText::new("Modular Rust music").color(colors.muted_text));
+                ui.add_space(14.0);
 
-        ui.horizontal(|ui| {
-            if ui.button("Rescan").clicked() {
-                self.rescan_library();
-            }
-            if ui.button("Save").clicked() {
-                self.save_config();
-            }
-        });
+                ui.horizontal(|ui| {
+                    if ui.button("Rescan").clicked() {
+                        self.rescan_library();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save_config();
+                    }
+                });
 
-        ui.add_space(10.0);
-        ui.label("Music path");
-        let add_from_enter = ui.text_edit_singleline(&mut self.path_entry).lost_focus()
-            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if add_from_enter || ui.button("Add folder or file").clicked() {
-            self.add_path_from_entry();
-        }
+                ui.add_space(10.0);
+                ui.label("Music path");
+                let add_from_enter = ui.text_edit_singleline(&mut self.path_entry).lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                ui.horizontal_wrapped(|ui| {
+                    if add_from_enter || ui.button("Add").clicked() {
+                        self.add_path_from_entry();
+                    }
+                    if ui.button("Choose...").clicked() {
+                        self.pick_library_folder();
+                    }
+                });
 
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Library").strong());
-        ui.horizontal(|ui| {
-            ui.label(format!("{} tracks", self.library.len()));
-            ui.separator();
-            ui.label(format!("{} roots", self.config.library_paths.len()));
-        });
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Library").strong());
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} tracks", self.library.len()));
+                    ui.separator();
+                    ui.label(format!("{} roots", self.config.library_paths.len()));
+                });
 
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Modules").strong());
-        self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
-        self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
-        self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
-        self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Modules").strong());
+                self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
+                self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
+                self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
+                self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
+                self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label(egui::RichText::new(&self.status_line).color(colors.muted_text));
-            if let Some(error) = &self.audio_error {
-                ui.label(egui::RichText::new(error).color(colors.danger));
-            }
-        });
+                ui.separator();
+                ui.label(egui::RichText::new(&self.status_line).color(colors.muted_text));
+                if let Some(error) = &self.audio_error {
+                    ui.label(egui::RichText::new(error).color(colors.danger));
+                }
+            });
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let colors = self.active_colors();
-        ui.add_space(4.0);
-        self.now_playing_ui(ui, ctx, colors);
-        ui.separator();
-        self.equalizer_ui(ui);
-        ui.separator();
-        self.theme_ui(ui, ctx);
-        ui.separator();
-        self.integration_ui(ui, colors);
-        ui.separator();
-        self.community_modules_ui(ui, colors);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                self.now_playing_ui(ui, ctx, colors);
+                ui.separator();
+                self.replay_gain_ui(ui);
+                ui.separator();
+                self.equalizer_ui(ui);
+                ui.separator();
+                self.theme_ui(ui, ctx);
+                ui.separator();
+                self.integration_ui(ui, colors);
+                ui.separator();
+                self.community_modules_ui(ui, colors);
+            });
     }
 
     fn cover_texture(
@@ -912,35 +1166,109 @@ impl AlloyApp {
         ui.label(egui::RichText::new("Idle").color(colors.muted_text));
     }
 
+    fn replay_gain_ui(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("ReplayGain").strong());
+            changed |= ui
+                .checkbox(&mut self.config.replay_gain.enabled, "Enabled")
+                .changed();
+        });
+
+        if !self.config.module_enabled(REPLAYGAIN_MODULE_ID) {
+            ui.label("ReplayGain module disabled");
+            if changed {
+                self.save_config();
+            }
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("replay-gain-mode")
+                .selected_text(match self.config.replay_gain.mode {
+                    ReplayGainMode::Track => "Track",
+                    ReplayGainMode::Album => "Album",
+                })
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.replay_gain.mode,
+                            ReplayGainMode::Track,
+                            "Track",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.replay_gain.mode,
+                            ReplayGainMode::Album,
+                            "Album",
+                        )
+                        .changed();
+                });
+        });
+        changed |= thin_slider(
+            ui,
+            egui::Slider::new(&mut self.config.replay_gain.preamp_db, -12.0..=12.0)
+                .text("Preamp")
+                .suffix(" dB"),
+            360.0,
+        )
+        .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.config.replay_gain.prevent_clipping,
+                "Prevent clipping",
+            )
+            .changed();
+
+        ui.horizontal(|ui| {
+            if ui.button("Apply").clicked() {
+                self.apply_eq_to_current();
+            }
+        });
+
+        if changed {
+            self.save_config();
+        }
+    }
+
     fn equalizer_ui(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("EQ").strong());
-            ui.checkbox(&mut self.config.equalizer.enabled, "Enabled");
+            changed |= ui
+                .checkbox(&mut self.config.equalizer.enabled, "Enabled")
+                .changed();
         });
 
         if !self.config.module_enabled(EQ_MODULE_ID) {
             ui.label("Equalizer module disabled");
+            if changed {
+                self.save_config();
+            }
             return;
         }
 
-        let mut changed = false;
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.config.equalizer.preamp_db, -9.0..=9.0)
-                    .text("Preamp")
-                    .suffix(" dB"),
-            )
-            .changed();
+        changed |= thin_slider(
+            ui,
+            egui::Slider::new(&mut self.config.equalizer.preamp_db, -9.0..=9.0)
+                .text("Preamp")
+                .suffix(" dB"),
+            360.0,
+        )
+        .changed();
 
         for band in &mut self.config.equalizer.bands {
             let label = format_band(band.frequency_hz);
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut band.gain_db, -12.0..=12.0)
-                        .text(label)
-                        .suffix(" dB"),
-                )
-                .changed();
+            changed |= thin_slider(
+                ui,
+                egui::Slider::new(&mut band.gain_db, -12.0..=12.0)
+                    .text(label)
+                    .suffix(" dB"),
+                360.0,
+            )
+            .changed();
         }
 
         ui.horizontal(|ui| {
@@ -962,24 +1290,27 @@ impl AlloyApp {
     }
 
     fn theme_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(egui::RichText::new("Theme").strong());
         let mut active = self.config.active_theme.clone();
-        egui::ComboBox::from_id_salt("theme-select")
-            .selected_text(
-                self.themes
-                    .find(&active)
-                    .map_or(active.as_str(), |theme| theme.definition.name.as_str()),
-            )
-            .show_ui(ui, |ui| {
-                for theme in self.themes.all() {
-                    ui.selectable_value(
-                        &mut active,
-                        theme.definition.id.clone(),
-                        theme.definition.name.as_str(),
-                    )
-                    .on_hover_text(theme.manifest.description.as_str());
-                }
-            });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Theme").strong());
+            egui::ComboBox::from_id_salt("theme-select")
+                .width(190.0)
+                .selected_text(
+                    self.themes
+                        .find(&active)
+                        .map_or(active.as_str(), |theme| theme.definition.name.as_str()),
+                )
+                .show_ui(ui, |ui| {
+                    for theme in self.themes.all() {
+                        ui.selectable_value(
+                            &mut active,
+                            theme.definition.id.clone(),
+                            theme.definition.name.as_str(),
+                        )
+                        .on_hover_text(theme.manifest.description.as_str());
+                    }
+                });
+        });
 
         if active != self.config.active_theme {
             self.config.active_theme = active;
@@ -1073,10 +1404,7 @@ impl AlloyApp {
         ui.horizontal(|ui| {
             ui.heading("Library");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_sized(
-                    [260.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.search).hint_text("Search"),
-                );
+                search_field(ui, &mut self.search, colors);
             });
         });
         ui.add_space(8.0);
@@ -1096,36 +1424,6 @@ impl AlloyApp {
         }
 
         let indices = self.filtered_indices();
-        egui::Grid::new("track-header")
-            .num_columns(5)
-            .spacing([16.0, 6.0])
-            .striped(false)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Art").strong().color(colors.muted_text));
-                ui.label(
-                    egui::RichText::new("Title")
-                        .strong()
-                        .color(colors.muted_text),
-                );
-                ui.label(
-                    egui::RichText::new("Artist")
-                        .strong()
-                        .color(colors.muted_text),
-                );
-                ui.label(
-                    egui::RichText::new("Album")
-                        .strong()
-                        .color(colors.muted_text),
-                );
-                ui.label(
-                    egui::RichText::new("Time")
-                        .strong()
-                        .color(colors.muted_text),
-                );
-                ui.end_row();
-            });
-        ui.separator();
-
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1134,20 +1432,34 @@ impl AlloyApp {
                     .spacing([16.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Art").strong().color(colors.muted_text));
+                        ui.label(
+                            egui::RichText::new("Title")
+                                .strong()
+                                .color(colors.muted_text),
+                        );
+                        ui.label(
+                            egui::RichText::new("Artist")
+                                .strong()
+                                .color(colors.muted_text),
+                        );
+                        ui.label(
+                            egui::RichText::new("Album")
+                                .strong()
+                                .color(colors.muted_text),
+                        );
+                        ui.label(
+                            egui::RichText::new("Time")
+                                .strong()
+                                .color(colors.muted_text),
+                        );
+                        ui.end_row();
+
                         for index in indices {
                             let (title, artist, album, duration, path, cover_path) = {
                                 let track = &self.library[index];
-                                let playing = self
-                                    .audio
-                                    .as_ref()
-                                    .and_then(AudioEngine::current_track)
-                                    .is_some_and(|current| current.id == track.id);
                                 (
-                                    if playing {
-                                        format!("> {}", track.title)
-                                    } else {
-                                        track.title.clone()
-                                    },
+                                    track.title.clone(),
                                     track.display_artist().to_owned(),
                                     track.display_album().to_owned(),
                                     track.duration,
@@ -1188,61 +1500,134 @@ impl AlloyApp {
                 (snapshot.position, snapshot.duration, snapshot.volume)
             });
 
-        ui.add_space(5.0);
-        ui.horizontal_centered(|ui| {
-            if transport_icon_button(ui, TransportIcon::Previous, "Previous track").clicked() {
-                self.play_previous();
-            }
-            let play_icon = match state {
-                PlaybackState::Playing => TransportIcon::Pause,
-                PlaybackState::Paused | PlaybackState::Stopped => TransportIcon::Play,
-            };
-            let play_tip = match state {
-                PlaybackState::Playing => "Pause",
-                PlaybackState::Paused | PlaybackState::Stopped => "Play",
-            };
-            if transport_icon_button(ui, play_icon, play_tip).clicked() {
-                self.toggle_playback();
-            }
-            if transport_icon_button(ui, TransportIcon::Next, "Next track").clicked() {
-                self.play_next();
-            }
-            if transport_icon_button(ui, TransportIcon::Stop, "Stop").clicked() {
-                self.stop();
-            }
+        let available_width = ui.available_width();
+        let show_stop = available_width > 560.0;
+        let show_volume = available_width > 860.0 && !self.config.playback.bit_perfect;
+        let show_time = available_width > 520.0;
+        let progress_width = if available_width > 760.0 {
+            (available_width * 0.32).clamp(180.0, 360.0)
+        } else if available_width > 620.0 {
+            150.0
+        } else {
+            0.0
+        };
 
-            ui.separator();
-            ui.label(format_duration(Some(position)));
-            let mut progress = duration.map_or(0.0, |duration| {
-                if duration.is_zero() {
-                    0.0
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ui.available_height()),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                if transport_icon_button(
+                    ui,
+                    TransportIcon::Shuffle,
+                    "Shuffle",
+                    self.config.playback.shuffle,
+                )
+                .clicked()
+                {
+                    self.config.playback.shuffle = !self.config.playback.shuffle;
+                    self.save_config();
+                }
+                let repeat_icon = if self.config.playback.repeat == RepeatMode::One {
+                    TransportIcon::RepeatOne
                 } else {
-                    position.as_secs_f32() / duration.as_secs_f32()
+                    TransportIcon::Repeat
+                };
+                if transport_icon_button(
+                    ui,
+                    repeat_icon,
+                    "Repeat",
+                    self.config.playback.repeat != RepeatMode::None,
+                )
+                .clicked()
+                {
+                    self.config.playback.repeat = match self.config.playback.repeat {
+                        RepeatMode::None => RepeatMode::All,
+                        RepeatMode::All => RepeatMode::One,
+                        RepeatMode::One => RepeatMode::None,
+                    };
+                    self.save_config();
                 }
-            });
-            let progress_response = ui.add_sized(
-                [360.0, 22.0],
-                egui::Slider::new(&mut progress, 0.0..=1.0).show_value(false),
-            );
-            if progress_response.drag_stopped() || progress_response.clicked() {
-                self.seek_to_fraction(progress);
-            }
-            ui.label(format_duration(duration));
 
-            ui.separator();
-            ui.label("Volume");
-            let mut new_volume = volume;
-            if ui
-                .add(egui::Slider::new(&mut new_volume, 0.0..=1.5).show_value(false))
-                .changed()
-            {
-                self.config.volume = new_volume;
-                if let Some(audio) = &mut self.audio {
-                    audio.set_volume(new_volume);
+                ui.separator();
+                if transport_icon_button(
+                    ui,
+                    TransportIcon::Previous,
+                    "Restart or previous track",
+                    false,
+                )
+                .clicked()
+                {
+                    self.rewind_or_previous();
                 }
-                self.save_config();
-            }
-        });
+                let play_icon = match state {
+                    PlaybackState::Playing => TransportIcon::Pause,
+                    PlaybackState::Paused | PlaybackState::Stopped => TransportIcon::Play,
+                };
+                let play_tip = match state {
+                    PlaybackState::Playing => "Pause",
+                    PlaybackState::Paused | PlaybackState::Stopped => "Play",
+                };
+                if transport_icon_button(ui, play_icon, play_tip, false).clicked() {
+                    self.toggle_playback();
+                }
+                if transport_icon_button(ui, TransportIcon::Next, "Next track", false).clicked() {
+                    self.play_next();
+                }
+                if show_stop
+                    && transport_icon_button(ui, TransportIcon::Stop, "Stop", false).clicked()
+                {
+                    self.stop();
+                }
+
+                if progress_width > 0.0 {
+                    ui.separator();
+                    if show_time {
+                        ui.label(format_duration(Some(position)));
+                    }
+                    let mut progress = duration.map_or(0.0, |duration| {
+                        if duration.is_zero() {
+                            0.0
+                        } else {
+                            position.as_secs_f32() / duration.as_secs_f32()
+                        }
+                    });
+                    let progress_response = thin_slider(
+                        ui,
+                        egui::Slider::new(&mut progress, 0.0..=1.0).show_value(false),
+                        progress_width,
+                    );
+                    if progress_response.drag_stopped() || progress_response.clicked() {
+                        self.seek_to_fraction(progress);
+                    }
+                    if show_time {
+                        ui.label(format_duration(duration));
+                    }
+                }
+
+                ui.separator();
+                if self.config.playback.bit_perfect {
+                    ui.label("Bit-perfect");
+                } else if show_volume {
+                    ui.label("Volume");
+                    let mut new_volume = volume;
+                    if thin_slider(
+                        ui,
+                        egui::Slider::new(&mut new_volume, 0.0..=1.5).show_value(false),
+                        120.0,
+                    )
+                    .changed()
+                    {
+                        self.config.volume = new_volume;
+                        if let Some(audio) = &mut self.audio {
+                            audio.set_volume(new_volume);
+                        }
+                        self.save_config();
+                    }
+                } else {
+                    ui.label(format!("{:.0}%", volume * 100.0));
+                }
+            },
+        );
     }
 }
 
@@ -1294,6 +1679,60 @@ fn settings_tab_button(ui: &mut egui::Ui, active: &mut SettingsTab, tab: Setting
     if ui.selectable_label(*active == tab, label).clicked() {
         *active = tab;
     }
+}
+
+fn thin_slider<'a>(ui: &mut egui::Ui, slider: egui::Slider<'a>, width: f32) -> egui::Response {
+    ui.add_sized(
+        [
+            width.min(ui.available_width()).max(96.0),
+            platform_slider_height(),
+        ],
+        slider,
+    )
+}
+
+#[cfg(target_os = "macos")]
+const fn platform_slider_height() -> f32 {
+    22.0
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn platform_slider_height() -> f32 {
+    18.0
+}
+
+fn search_field(ui: &mut egui::Ui, search: &mut String, colors: ThemeColors) {
+    let width = ui.available_width().min(310.0).max(210.0);
+    egui::Frame::new()
+        .fill(colors.surface_muted)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_min_width(width);
+            ui.horizontal_centered(|ui| {
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 20.0), egui::Sense::hover());
+                draw_search_icon(ui.painter(), icon_rect, colors.muted_text);
+                ui.add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::TextEdit::singleline(search)
+                        .hint_text("Search library")
+                        .frame(false),
+                );
+            });
+        });
+}
+
+fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let center = egui::pos2(rect.left() + 7.5, rect.center().y - 1.5);
+    painter.circle_stroke(center, 5.0, egui::Stroke::new(1.7, color));
+    painter.line_segment(
+        [
+            egui::pos2(center.x + 3.8, center.y + 3.8),
+            egui::pos2(rect.right() - 2.0, rect.bottom() - 3.0),
+        ],
+        egui::Stroke::new(1.7, color),
+    );
 }
 
 fn option_text_field(
@@ -1367,12 +1806,17 @@ fn transport_icon_button(
     ui: &mut egui::Ui,
     icon: TransportIcon,
     tooltip: &'static str,
+    active: bool,
 ) -> egui::Response {
-    let response = ui
-        .add_sized([42.0, 38.0], egui::Button::new(""))
-        .on_hover_text(tooltip);
+    let mut button = egui::Button::new("");
+    if active {
+        button = button.fill(ui.visuals().selection.bg_fill);
+    }
+    let response = ui.add_sized([42.0, 38.0], button).on_hover_text(tooltip);
     let color = if response.hovered() {
         ui.visuals().strong_text_color()
+    } else if active {
+        ui.visuals().selection.stroke.color
     } else {
         ui.visuals().text_color()
     };
@@ -1473,7 +1917,80 @@ fn draw_transport_icon(
                 egui::Stroke::NONE,
             ));
         }
+        TransportIcon::Shuffle => {
+            let stroke = egui::Stroke::new(2.0, color);
+            let left_top = egui::pos2(rect.left(), rect.top() + rect.height() * 0.28);
+            let left_bottom = egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.28);
+            let right_top = egui::pos2(rect.right() - 4.0, rect.top() + rect.height() * 0.25);
+            let right_bottom = egui::pos2(rect.right() - 4.0, rect.bottom() - rect.height() * 0.25);
+            painter.line_segment([left_top, rect.center()], stroke);
+            painter.line_segment([rect.center(), right_bottom], stroke);
+            painter.line_segment(
+                [left_bottom, egui::pos2(rect.center().x, left_bottom.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(rect.center().x, left_bottom.y), right_top],
+                stroke,
+            );
+            draw_arrow_head(painter, right_top, true, color);
+            draw_arrow_head(painter, right_bottom, true, color);
+        }
+        TransportIcon::Repeat | TransportIcon::RepeatOne => {
+            let stroke = egui::Stroke::new(2.0, color);
+            let top_y = rect.top() + rect.height() * 0.28;
+            let bottom_y = rect.bottom() - rect.height() * 0.28;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 4.0, top_y),
+                    egui::pos2(rect.right() - 5.0, top_y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.right() - 4.0, bottom_y),
+                    egui::pos2(rect.left() + 5.0, bottom_y),
+                ],
+                stroke,
+            );
+            draw_arrow_head(painter, egui::pos2(rect.right() - 4.0, top_y), true, color);
+            draw_arrow_head(
+                painter,
+                egui::pos2(rect.left() + 4.0, bottom_y),
+                false,
+                color,
+            );
+            if matches!(icon, TransportIcon::RepeatOne) {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "1",
+                    egui::FontId::proportional(12.0),
+                    color,
+                );
+            }
+        }
     }
+}
+
+fn draw_arrow_head(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    points_right: bool,
+    color: egui::Color32,
+) {
+    let direction = if points_right { 1.0 } else { -1.0 };
+    let points = vec![
+        tip,
+        egui::pos2(tip.x - direction * 5.0, tip.y - 4.0),
+        egui::pos2(tip.x - direction * 5.0, tip.y + 4.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn category_name(category: alloy_core::ModuleCategory) -> &'static str {

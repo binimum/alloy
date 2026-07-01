@@ -1,4 +1,5 @@
-use crate::audio::{EqBand, EqProfile};
+use crate::audio::{EqBand, EqProfile, ReplayGainProfile};
+use alloy_core::Track;
 use anyhow::Context;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 pub const CORE_MODULE_ID: &str = "alloy.core";
 pub const LOCAL_SOURCE_MODULE_ID: &str = "alloy.sources.local";
 pub const EQ_MODULE_ID: &str = "alloy.audio.eq";
+pub const REPLAYGAIN_MODULE_ID: &str = "alloy.audio.replaygain";
 pub const LASTFM_MODULE_ID: &str = "alloy.integrations.lastfm";
 pub const DISCORD_MODULE_ID: &str = "alloy.integrations.discord";
 
@@ -51,6 +53,10 @@ pub struct AppConfig {
     pub modules: BTreeMap<String, ModuleToggle>,
     #[serde(default)]
     pub equalizer: EqualizerConfig,
+    #[serde(default)]
+    pub replay_gain: ReplayGainConfig,
+    #[serde(default)]
+    pub playback: PlaybackConfig,
     #[serde(default = "default_audio_chain")]
     pub audio_chain: Vec<AudioChainNodeConfig>,
     #[serde(default)]
@@ -69,6 +75,8 @@ impl Default for AppConfig {
             library_paths: Vec::new(),
             modules: default_modules(),
             equalizer: EqualizerConfig::default(),
+            replay_gain: ReplayGainConfig::default(),
+            playback: PlaybackConfig::default(),
             audio_chain: default_audio_chain(),
             cover_art: CoverArtConfig::default(),
             lastfm: LastFmConfig::default(),
@@ -156,6 +164,29 @@ impl AppConfig {
         }
     }
 
+    pub fn replay_gain_profile(&self, track: &Track) -> ReplayGainProfile {
+        let replay_gain = &track.replay_gain;
+        let (gain_db, peak) = match self.replay_gain.mode {
+            ReplayGainMode::Track => (
+                replay_gain.track_gain_db.or(replay_gain.album_gain_db),
+                replay_gain.track_peak.or(replay_gain.album_peak),
+            ),
+            ReplayGainMode::Album => (
+                replay_gain.album_gain_db.or(replay_gain.track_gain_db),
+                replay_gain.album_peak.or(replay_gain.track_peak),
+            ),
+        };
+
+        ReplayGainProfile {
+            enabled: self.module_enabled(REPLAYGAIN_MODULE_ID)
+                && self.replay_gain.enabled
+                && gain_db.is_some(),
+            gain_db: gain_db.unwrap_or(0.0) + self.replay_gain.preamp_db,
+            peak,
+            prevent_clipping: self.replay_gain.prevent_clipping,
+        }
+    }
+
     pub fn ensure_defaults(&mut self) {
         for (id, toggle) in default_modules() {
             self.modules.entry(id).or_insert(toggle);
@@ -165,6 +196,25 @@ impl AppConfig {
         }
         if self.audio_chain.is_empty() {
             self.audio_chain = default_audio_chain();
+        } else {
+            for default_node in default_audio_chain() {
+                if !self
+                    .audio_chain
+                    .iter()
+                    .any(|node| node.id == default_node.id)
+                {
+                    if default_node.id == REPLAYGAIN_MODULE_ID {
+                        let insert_index = self
+                            .audio_chain
+                            .iter()
+                            .position(|node| node.id == EQ_MODULE_ID)
+                            .unwrap_or(self.audio_chain.len());
+                        self.audio_chain.insert(insert_index, default_node);
+                    } else {
+                        self.audio_chain.push(default_node);
+                    }
+                }
+            }
         }
     }
 }
@@ -200,6 +250,56 @@ pub struct EqualizerBandConfig {
     pub gain_db: f32,
     #[serde(default = "default_q")]
     pub q: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayGainConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: ReplayGainMode,
+    #[serde(default)]
+    pub preamp_db: f32,
+    #[serde(default = "default_true")]
+    pub prevent_clipping: bool,
+}
+
+impl Default for ReplayGainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: ReplayGainMode::default(),
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplayGainMode {
+    #[default]
+    Track,
+    Album,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaybackConfig {
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default)]
+    pub repeat: RepeatMode,
+    #[serde(default)]
+    pub bit_perfect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepeatMode {
+    #[default]
+    None,
+    All,
+    One,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +409,7 @@ fn default_modules() -> BTreeMap<String, ModuleToggle> {
     [
         (CORE_MODULE_ID, true),
         (LOCAL_SOURCE_MODULE_ID, true),
+        (REPLAYGAIN_MODULE_ID, true),
         (EQ_MODULE_ID, true),
         (LASTFM_MODULE_ID, false),
         (DISCORD_MODULE_ID, false),
@@ -319,10 +420,16 @@ fn default_modules() -> BTreeMap<String, ModuleToggle> {
 }
 
 fn default_audio_chain() -> Vec<AudioChainNodeConfig> {
-    vec![AudioChainNodeConfig {
-        id: EQ_MODULE_ID.to_owned(),
-        enabled: true,
-    }]
+    vec![
+        AudioChainNodeConfig {
+            id: REPLAYGAIN_MODULE_ID.to_owned(),
+            enabled: true,
+        },
+        AudioChainNodeConfig {
+            id: EQ_MODULE_ID.to_owned(),
+            enabled: true,
+        },
+    ]
 }
 
 fn default_eq_bands() -> Vec<EqualizerBandConfig> {
@@ -364,6 +471,7 @@ mod tests {
 
         assert!(config.module_enabled(CORE_MODULE_ID));
         assert!(config.module_enabled(LOCAL_SOURCE_MODULE_ID));
+        assert!(config.module_enabled(REPLAYGAIN_MODULE_ID));
         assert!(config.module_enabled(EQ_MODULE_ID));
         assert!(!config.module_enabled(LASTFM_MODULE_ID));
     }

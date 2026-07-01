@@ -1,8 +1,11 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod config;
 mod integrations;
 mod library;
+mod native_file_dialog;
 mod plugins;
 mod theme;
 

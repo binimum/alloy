@@ -70,7 +70,7 @@ pub trait AlloyModule: Send {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -79,6 +79,8 @@ pub struct Track {
     pub path: PathBuf,
     #[serde(default)]
     pub cover_path: Option<PathBuf>,
+    #[serde(default)]
+    pub replay_gain: ReplayGain,
     pub duration: Option<Duration>,
     #[serde(default)]
     pub source: String,
@@ -102,6 +104,18 @@ impl Track {
             &self.album
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayGain {
+    #[serde(default)]
+    pub track_gain_db: Option<f32>,
+    #[serde(default)]
+    pub album_gain_db: Option<f32>,
+    #[serde(default)]
+    pub track_peak: Option<f32>,
+    #[serde(default)]
+    pub album_peak: Option<f32>,
 }
 
 pub trait MusicSourceModule: AlloyModule {

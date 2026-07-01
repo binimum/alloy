@@ -1,12 +1,15 @@
-use alloy_core::{ModuleCategory, ModuleManifest, MusicSourceModule, Track};
+use alloy_core::{ModuleCategory, ModuleManifest, MusicSourceModule, ReplayGain, Track};
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["flac", "mp3", "ogg", "opus", "wav", "m4a", "aac"];
 const COVER_STEMS: &[&str] = &["cover", "folder", "front", "album", "artwork"];
 const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
+const METADATA_READ_LIMIT: u64 = 512 * 1024;
 
 pub struct LocalMusicSource {
     manifest: ModuleManifest,
@@ -109,17 +112,167 @@ fn track_from_path(path: &Path) -> Option<Track> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("Untitled");
     let (artist, title) = parse_stem(stem);
+    let metadata = read_track_metadata(&canonical);
 
     Some(Track {
         id: stable_track_id(&canonical),
-        title,
-        artist,
-        album: String::new(),
+        title: metadata.title.unwrap_or(title),
+        artist: metadata.artist.unwrap_or(artist),
+        album: metadata.album.unwrap_or_default(),
         path: canonical.clone(),
         cover_path: find_cover_path(&canonical),
+        replay_gain: metadata.replay_gain,
         duration: read_duration(&canonical),
         source: "alloy.sources.local".to_owned(),
     })
+}
+
+#[derive(Debug, Default)]
+struct TrackMetadata {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    replay_gain: ReplayGain,
+}
+
+fn read_track_metadata(path: &Path) -> TrackMetadata {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+
+    let comments = if extension.eq_ignore_ascii_case("flac") {
+        read_flac_vorbis_comments(path)
+    } else if extension.eq_ignore_ascii_case("ogg") || extension.eq_ignore_ascii_case("opus") {
+        read_ogg_vorbis_comments(path)
+    } else {
+        None
+    };
+
+    comments.map_or_else(TrackMetadata::default, comments_to_metadata)
+}
+
+fn read_limited(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = file.take(METADATA_READ_LIMIT);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn read_flac_vorbis_comments(path: &Path) -> Option<BTreeMap<String, String>> {
+    let bytes = read_limited(path)?;
+    if !bytes.starts_with(b"fLaC") {
+        return None;
+    }
+
+    let mut offset = 4;
+    while offset + 4 <= bytes.len() {
+        let header = bytes.get(offset..offset + 4)?;
+        let block_type = header[0] & 0x7f;
+        let is_last = header[0] & 0x80 != 0;
+        let length =
+            (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+        offset += 4;
+
+        let payload = bytes.get(offset..offset + length)?;
+        if block_type == 4 {
+            return parse_vorbis_comment_block(payload);
+        }
+
+        offset += length;
+        if is_last {
+            break;
+        }
+    }
+
+    None
+}
+
+fn read_ogg_vorbis_comments(path: &Path) -> Option<BTreeMap<String, String>> {
+    let bytes = read_limited(path)?;
+    if let Some(position) = find_subslice(&bytes, b"\x03vorbis") {
+        return parse_vorbis_comment_block(bytes.get(position + 7..)?);
+    }
+    if let Some(position) = find_subslice(&bytes, b"OpusTags") {
+        return parse_vorbis_comment_block(bytes.get(position + 8..)?);
+    }
+    None
+}
+
+fn parse_vorbis_comment_block(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+    let mut offset = 0;
+    let vendor_length = read_le_u32(bytes, &mut offset)?;
+    offset = offset.checked_add(usize::try_from(vendor_length).ok()?)?;
+    if offset > bytes.len() {
+        return None;
+    }
+
+    let comment_count = read_le_u32(bytes, &mut offset)?;
+    let mut comments = BTreeMap::new();
+    for _ in 0..comment_count {
+        let length = usize::try_from(read_le_u32(bytes, &mut offset)?).ok()?;
+        let value = bytes.get(offset..offset + length)?;
+        offset += length;
+        let value = std::str::from_utf8(value).ok()?;
+        let Some((key, value)) = value.split_once('=') else {
+            continue;
+        };
+        comments
+            .entry(key.trim().to_uppercase())
+            .or_insert_with(|| value.trim().to_owned());
+    }
+
+    Some(comments)
+}
+
+fn comments_to_metadata(comments: BTreeMap<String, String>) -> TrackMetadata {
+    TrackMetadata {
+        title: non_empty_comment(&comments, "TITLE"),
+        artist: non_empty_comment(&comments, "ARTIST")
+            .or_else(|| non_empty_comment(&comments, "ALBUMARTIST")),
+        album: non_empty_comment(&comments, "ALBUM"),
+        replay_gain: ReplayGain {
+            track_gain_db: parse_gain_db(comments.get("REPLAYGAIN_TRACK_GAIN")),
+            album_gain_db: parse_gain_db(comments.get("REPLAYGAIN_ALBUM_GAIN")),
+            track_peak: parse_peak(comments.get("REPLAYGAIN_TRACK_PEAK")),
+            album_peak: parse_peak(comments.get("REPLAYGAIN_ALBUM_PEAK")),
+        },
+    }
+}
+
+fn non_empty_comment(comments: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    comments.get(key).and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    })
+}
+
+fn parse_gain_db(value: Option<&String>) -> Option<f32> {
+    value?
+        .split_whitespace()
+        .next()
+        .and_then(|number| number.parse::<f32>().ok())
+}
+
+fn parse_peak(value: Option<&String>) -> Option<f32> {
+    value?.trim().parse::<f32>().ok()
+}
+
+fn read_le_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let value = bytes.get(*offset..*offset + 4)?;
+    *offset += 4;
+    Some(u32::from_le_bytes(value.try_into().ok()?))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn parse_stem(stem: &str) -> (String, String) {
@@ -207,5 +360,36 @@ mod tests {
         std::fs::write(&cover, []).expect("cover");
 
         assert_eq!(find_cover_path(&track), Some(cover));
+    }
+
+    #[test]
+    fn parses_vorbis_comments_for_ogg_and_flac_metadata() {
+        let comments = parse_vorbis_comment_block(&vorbis_comment_block(&[
+            ("TITLE", "Rae"),
+            ("ARTIST", "Autechre"),
+            ("ALBUM", "LP5"),
+            ("REPLAYGAIN_TRACK_GAIN", "-6.40 dB"),
+            ("REPLAYGAIN_TRACK_PEAK", "0.9412"),
+        ]))
+        .expect("comments");
+        let metadata = comments_to_metadata(comments);
+
+        assert_eq!(metadata.title.as_deref(), Some("Rae"));
+        assert_eq!(metadata.artist.as_deref(), Some("Autechre"));
+        assert_eq!(metadata.album.as_deref(), Some("LP5"));
+        assert_eq!(metadata.replay_gain.track_gain_db, Some(-6.4));
+        assert_eq!(metadata.replay_gain.track_peak, Some(0.9412));
+    }
+
+    fn vorbis_comment_block(comments: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for (key, value) in comments {
+            let comment = format!("{key}={value}");
+            bytes.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(comment.as_bytes());
+        }
+        bytes
     }
 }

@@ -4,10 +4,12 @@ Alloy is a lightweight Rust desktop music player built around a small core API a
 
 ## What Works
 
-- Native desktop UI with library, search, transport controls, seeking, volume, drag-and-drop, and a polished default theme.
+- Native desktop UI with library, search, transport controls, seeking, volume, drag-and-drop, native file/folder pickers, and a polished default theme.
 - Local music source module that scans folders or individual files.
 - End-to-end local playback through `rodio`, including MP3, FLAC, Ogg/Vorbis, WAV, AAC/M4A where the backend supports it.
-- Modular audio processing chain. The built-in EQ is one processor in the chain, and native community processors can be ordered around it.
+- FLAC and Ogg/Opus Vorbis-comment metadata for title, artist, album, and ReplayGain tags.
+- Modular audio processing chain. The built-in ReplayGain and EQ processors are normal chain nodes, and native community processors can be ordered around them.
+- Shuffle, repeat-all, repeat-one, restart/previous transport behavior, and a bit-perfect mode that bypasses Alloy DSP and app volume.
 - JPEG/PNG sidecar album covers from files such as `cover.jpg`, `folder.png`, `front.jpg`, or an image matching the track file stem.
 - Built-in themes: Graphite, Linen, and Signal.
 - Optional Last.fm module for now-playing updates and scrobbling.
@@ -36,7 +38,7 @@ You can pass a music folder or file directly:
 /home/max/.cargo/bin/cargo run --release --bin alloy -- --library /path/to/Music
 ```
 
-Inside the app, add folders from the left panel or drop audio files/folders onto the window.
+Inside the app, add folders from the native picker in the left panel or Settings, type a path manually, or drop audio files/folders onto the window.
 
 ## Platform Support
 
@@ -52,10 +54,12 @@ This repository includes `.github/workflows/desktop-builds.yml`, which builds:
 
 - `alloy-linux-x86_64`
 - `alloy-windows-x86_64`
-- `alloy-macos-x86_64`
-- `alloy-macos-aarch64`
+- `alloy-macos-x86_64` as `Alloy.app`
+- `alloy-macos-aarch64` as `Alloy.app`
 
 The local workspace here is Linux-only, so Windows and macOS artifacts should be produced by that workflow or by building on those operating systems directly.
+
+Windows release builds are configured as GUI binaries so launching `alloy.exe` does not open a separate command prompt.
 
 ## Configuration
 
@@ -74,6 +78,9 @@ enabled = true
 [modules."alloy.audio.eq"]
 enabled = true
 
+[modules."alloy.audio.replaygain"]
+enabled = true
+
 [modules."alloy.integrations.lastfm"]
 enabled = false
 
@@ -87,11 +94,36 @@ The audio pipeline is ordered by `audio_chain`:
 
 ```toml
 [[audio_chain]]
+id = "alloy.audio.replaygain"
+enabled = true
+
+[[audio_chain]]
 id = "alloy.audio.eq"
 enabled = true
 ```
 
-Native audio processor modules can be added to the same list by module id. The Settings window also provides a visual chain editor with enable toggles and ordering controls.
+Native audio processor modules can be added to the same list by module id. The Settings window also provides a timeline-style chain editor with enable toggles, ordering controls, and per-node configuration.
+
+ReplayGain is configured independently from the chain node:
+
+```toml
+[replay_gain]
+enabled = true
+mode = "track"
+preamp_db = 0.0
+prevent_clipping = true
+```
+
+Playback behavior is configurable too:
+
+```toml
+[playback]
+shuffle = false
+repeat = "none"
+bit_perfect = false
+```
+
+Bit-perfect mode is a best-effort Alloy bypass: the app disables its DSP chain and volume scaling. The final output can still be affected by the decoder, `rodio`/`cpal`, the selected output device format, or the operating-system mixer.
 
 Album cover display is configurable:
 

@@ -2,7 +2,7 @@ id = "midnight-green"
 name = "Midnight Green"
 version = "0.1.0"
 description = "A calm dark community theme example."
-authors = ["Alloy Community"]
+authors = ["binimum"]
 mode = "dark"
 
 [colors]

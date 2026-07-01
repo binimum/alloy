@@ -55,7 +55,44 @@ jobs:
         shell: bash
         run: |
           mkdir -p "dist/${{ matrix.artifact }}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}/"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            mkdir -p "dist/${{ matrix.artifact }}/Alloy.app/Contents/MacOS"
+            mkdir -p "dist/${{ matrix.artifact }}/Alloy.app/Contents/Resources"
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}/Alloy.app/Contents/MacOS/Alloy"
+            chmod +x "dist/${{ matrix.artifact }}/Alloy.app/Contents/MacOS/Alloy"
+            cat > "dist/${{ matrix.artifact }}/Alloy.app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>Alloy</string>
+            <key>CFBundleExecutable</key>
+            <string>Alloy</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.alloy.player</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>Alloy</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.run_number }}</string>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.music</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          else
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}/"
+          fi
           cp README.md "dist/${{ matrix.artifact }}/"
 
       - name: Upload artifact

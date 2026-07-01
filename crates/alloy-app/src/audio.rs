@@ -33,6 +33,7 @@ pub struct AudioEngine {
     base_position: Duration,
     duration: Option<Duration>,
     volume: f32,
+    bit_perfect: bool,
 }
 
 impl AudioEngine {
@@ -49,6 +50,7 @@ impl AudioEngine {
             base_position: Duration::ZERO,
             duration: None,
             volume,
+            bit_perfect: false,
         })
     }
 
@@ -56,8 +58,9 @@ impl AudioEngine {
         &mut self,
         track: Track,
         processor_factories: Vec<Box<dyn SampleBlockProcessorFactory>>,
+        bit_perfect: bool,
     ) -> anyhow::Result<()> {
-        self.play_from(track, Duration::ZERO, processor_factories)
+        self.play_from(track, Duration::ZERO, processor_factories, bit_perfect)
     }
 
     pub fn play_from(
@@ -65,26 +68,32 @@ impl AudioEngine {
         track: Track,
         offset: Duration,
         processor_factories: Vec<Box<dyn SampleBlockProcessorFactory>>,
+        bit_perfect: bool,
     ) -> anyhow::Result<()> {
         let file = File::open(&track.path)
             .with_context(|| format!("failed to open {}", track.path.display()))?;
         let decoder = Decoder::new(BufReader::new(file))
             .with_context(|| format!("failed to decode {}", track.path.display()))?;
         let duration = decoder.total_duration().or(track.duration);
-        let source = decoder.convert_samples::<f32>();
-        let channels = source.channels();
-        let sample_rate = source.sample_rate();
-        let source = source.skip_duration(offset);
         let sink = Sink::try_new(&self.handle).context("failed to create audio sink")?;
-        let processors = processor_factories
-            .into_iter()
-            .map(|factory| factory.create(channels, sample_rate))
-            .collect::<anyhow::Result<Vec<_>>>()
-            .context("failed to create audio processors")?;
-        let source = ProcessingSource::new(source, channels, sample_rate, processors);
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        let source = decoder.skip_duration(offset);
 
-        sink.set_volume(self.volume);
-        sink.append(source);
+        if bit_perfect {
+            sink.set_volume(1.0);
+            sink.append(source);
+        } else {
+            let source = source.convert_samples::<f32>();
+            let processors = processor_factories
+                .into_iter()
+                .map(|factory| factory.create(channels, sample_rate))
+                .collect::<anyhow::Result<Vec<_>>>()
+                .context("failed to create audio processors")?;
+            let source = ProcessingSource::new(source, channels, sample_rate, processors);
+            sink.set_volume(self.volume);
+            sink.append(source);
+        }
 
         if let Some(old_sink) = self.sink.take() {
             old_sink.stop();
@@ -96,6 +105,7 @@ impl AudioEngine {
         self.started_at = Some(Instant::now());
         self.base_position = offset;
         self.duration = duration;
+        self.bit_perfect = bit_perfect;
         Ok(())
     }
 
@@ -131,11 +141,14 @@ impl AudioEngine {
         self.started_at = None;
         self.base_position = Duration::ZERO;
         self.duration = None;
+        self.bit_perfect = false;
     }
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.5);
-        if let Some(sink) = &self.sink {
+        if let Some(sink) = &self.sink
+            && !self.bit_perfect
+        {
             sink.set_volume(self.volume);
         }
     }
@@ -205,6 +218,33 @@ pub struct EqBand {
     pub q: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplayGainProfile {
+    pub enabled: bool,
+    pub gain_db: f32,
+    pub peak: Option<f32>,
+    pub prevent_clipping: bool,
+}
+
+impl ReplayGainProfile {
+    #[must_use]
+    pub fn effective_amplification(&self) -> f32 {
+        if !self.enabled {
+            return 1.0;
+        }
+
+        let mut amplification = db_to_amp(self.gain_db);
+        if self.prevent_clipping
+            && let Some(peak) = self.peak
+            && peak > 0.0
+            && peak * amplification > 1.0
+        {
+            amplification = 1.0 / peak;
+        }
+        amplification
+    }
+}
+
 pub trait SampleBlockProcessor: Send {
     fn process(&mut self, samples: &mut [f32], channels: u16, sample_rate: u32);
 }
@@ -239,6 +279,52 @@ impl SampleBlockProcessorFactory for EqProcessorFactory {
             sample_rate,
             &self.profile,
         )))
+    }
+}
+
+pub struct ReplayGainProcessorFactory {
+    profile: ReplayGainProfile,
+}
+
+impl ReplayGainProcessorFactory {
+    #[must_use]
+    pub fn new(profile: ReplayGainProfile) -> Self {
+        Self { profile }
+    }
+}
+
+impl SampleBlockProcessorFactory for ReplayGainProcessorFactory {
+    fn create(
+        self: Box<Self>,
+        _channels: u16,
+        _sample_rate: u32,
+    ) -> anyhow::Result<Box<dyn SampleBlockProcessor>> {
+        Ok(Box::new(ReplayGainProcessor {
+            amplification: self.profile.effective_amplification(),
+            prevent_clipping: self.profile.prevent_clipping,
+        }))
+    }
+}
+
+struct ReplayGainProcessor {
+    amplification: f32,
+    prevent_clipping: bool,
+}
+
+impl SampleBlockProcessor for ReplayGainProcessor {
+    fn process(&mut self, samples: &mut [f32], _channels: u16, _sample_rate: u32) {
+        if (self.amplification - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+
+        for sample in samples {
+            let processed = *sample * self.amplification;
+            *sample = if self.prevent_clipping {
+                processed.clamp(-1.0, 1.0)
+            } else {
+                processed
+            };
+        }
     }
 }
 
@@ -438,6 +524,18 @@ mod tests {
     #[test]
     fn zero_db_is_unity_gain() {
         assert!((db_to_amp(0.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn replay_gain_prevents_clipping_when_peak_would_overflow() {
+        let profile = ReplayGainProfile {
+            enabled: true,
+            gain_db: 6.0,
+            peak: Some(0.8),
+            prevent_clipping: true,
+        };
+
+        assert!((profile.effective_amplification() - 1.25).abs() < 0.001);
     }
 
     #[test]

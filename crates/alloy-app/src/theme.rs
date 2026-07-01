@@ -1,5 +1,5 @@
 use alloy_core::{ModuleCategory, ModuleManifest, ThemeDefinition, ThemeMode};
-use egui::{Color32, Visuals};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, TextStyle, Visuals};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -60,12 +60,13 @@ pub fn apply_theme(ctx: &egui::Context, theme: &AlloyTheme) {
     visuals.hyperlink_color = colors.accent;
     visuals.override_text_color = Some(colors.text);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = egui::Style::default();
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(11.0, 7.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.slider_width = 170.0;
-    style.spacing.interact_size = egui::vec2(34.0, 32.0);
+    style.spacing.interact_size = egui::vec2(34.0, 30.0);
+    apply_type_scale(&mut style);
     for radius in [
         &mut style.visuals.widgets.inactive.corner_radius,
         &mut style.visuals.widgets.hovered.corner_radius,
@@ -80,6 +81,98 @@ pub fn apply_theme(ctx: &egui::Context, theme: &AlloyTheme) {
 
     ctx.set_style(style);
 }
+
+pub fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let default_body_stack = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut heading_stack = Vec::new();
+
+    if let Some(bytes) = load_first_font(FUNNEL_SANS_FONT_CANDIDATES) {
+        fonts
+            .font_data
+            .insert("funnel-sans".to_owned(), FontData::from_owned(bytes).into());
+        heading_stack.push("funnel-sans".to_owned());
+    }
+
+    if let Some(bytes) = load_first_font(INTER_FONT_CANDIDATES) {
+        fonts.font_data.insert(
+            "inter-variable".to_owned(),
+            FontData::from_owned(bytes).into(),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "inter-variable".to_owned());
+        heading_stack.push("inter-variable".to_owned());
+    }
+
+    heading_stack.extend(default_body_stack);
+    fonts.families.insert(heading_family(), heading_stack);
+    ctx.set_fonts(fonts);
+}
+
+fn apply_type_scale(style: &mut egui::Style) {
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(23.0, heading_family())),
+        (
+            TextStyle::Name("section".into()),
+            FontId::new(18.0, heading_family()),
+        ),
+        (TextStyle::Body, FontId::new(14.5, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
+    ]
+    .into();
+}
+
+fn heading_family() -> FontFamily {
+    FontFamily::Name("alloy-heading".into())
+}
+
+fn load_first_font(candidates: &[&str]) -> Option<Vec<u8>> {
+    candidates.iter().find_map(|path| std::fs::read(path).ok())
+}
+
+const INTER_FONT_CANDIDATES: &[&str] = &[
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/InterVariable.ttf"
+    ),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Inter.ttf"),
+    "/usr/share/fonts/truetype/inter/InterVariable.ttf",
+    "/usr/share/fonts/truetype/inter/Inter.ttf",
+    "/Library/Fonts/Inter Variable.ttf",
+    "/Library/Fonts/Inter.ttf",
+    "C:\\Windows\\Fonts\\InterVariable.ttf",
+    "C:\\Windows\\Fonts\\Inter.ttf",
+];
+
+const FUNNEL_SANS_FONT_CANDIDATES: &[&str] = &[
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/FunnelSans.ttf"),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/FunnelSans-VariableFont_wght.ttf"
+    ),
+    "/usr/share/fonts/truetype/funnel-sans/FunnelSans.ttf",
+    "/usr/share/fonts/truetype/funnelsans/FunnelSans.ttf",
+    "/Library/Fonts/Funnel Sans.ttf",
+    "C:\\Windows\\Fonts\\FunnelSans.ttf",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThemeColors {

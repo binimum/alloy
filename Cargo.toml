@@ -8,7 +8,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://example.invalid/alloy"
+repository = "https://github.com/binimum/alloy"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
