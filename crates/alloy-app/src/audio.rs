@@ -6,6 +6,9 @@ use std::io::BufReader;
 use std::time::{Duration, Instant};
 
 const PROCESSING_BLOCK_SAMPLES: usize = 1024;
+const PLAY_FADE_DURATION: Duration = Duration::from_millis(180);
+const PAUSE_FADE_DURATION: Duration = Duration::from_millis(160);
+const SEEK_FADE_DURATION: Duration = Duration::from_millis(70);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
@@ -34,6 +37,7 @@ pub struct AudioEngine {
     duration: Option<Duration>,
     volume: f32,
     bit_perfect: bool,
+    fade: Option<VolumeFade>,
 }
 
 impl AudioEngine {
@@ -51,6 +55,7 @@ impl AudioEngine {
             duration: None,
             volume,
             bit_perfect: false,
+            fade: None,
         })
     }
 
@@ -60,7 +65,13 @@ impl AudioEngine {
         processor_factories: Vec<Box<dyn SampleBlockProcessorFactory>>,
         bit_perfect: bool,
     ) -> anyhow::Result<()> {
-        self.play_from(track, Duration::ZERO, processor_factories, bit_perfect)
+        self.play_from_with_fade(
+            track,
+            Duration::ZERO,
+            processor_factories,
+            bit_perfect,
+            PLAY_FADE_DURATION,
+        )
     }
 
     pub fn play_from(
@@ -69,6 +80,23 @@ impl AudioEngine {
         offset: Duration,
         processor_factories: Vec<Box<dyn SampleBlockProcessorFactory>>,
         bit_perfect: bool,
+    ) -> anyhow::Result<()> {
+        self.play_from_with_fade(
+            track,
+            offset,
+            processor_factories,
+            bit_perfect,
+            SEEK_FADE_DURATION,
+        )
+    }
+
+    fn play_from_with_fade(
+        &mut self,
+        track: Track,
+        offset: Duration,
+        processor_factories: Vec<Box<dyn SampleBlockProcessorFactory>>,
+        bit_perfect: bool,
+        fade_duration: Duration,
     ) -> anyhow::Result<()> {
         let file = File::open(&track.path)
             .with_context(|| format!("failed to open {}", track.path.display()))?;
@@ -79,6 +107,12 @@ impl AudioEngine {
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
         let source = decoder.skip_duration(offset);
+        let target_volume = if bit_perfect { 1.0 } else { self.volume };
+        let fade_duration = if bit_perfect {
+            Duration::ZERO
+        } else {
+            fade_duration
+        };
 
         if bit_perfect {
             sink.set_volume(1.0);
@@ -91,7 +125,11 @@ impl AudioEngine {
                 .collect::<anyhow::Result<Vec<_>>>()
                 .context("failed to create audio processors")?;
             let source = ProcessingSource::new(source, channels, sample_rate, processors);
-            sink.set_volume(self.volume);
+            sink.set_volume(if fade_duration.is_zero() {
+                target_volume
+            } else {
+                0.0
+            });
             sink.append(source);
         }
 
@@ -106,6 +144,16 @@ impl AudioEngine {
         self.base_position = offset;
         self.duration = duration;
         self.bit_perfect = bit_perfect;
+        self.fade = if fade_duration.is_zero() {
+            None
+        } else {
+            Some(VolumeFade::new(
+                0.0,
+                target_volume,
+                fade_duration,
+                FadeAction::None,
+            ))
+        };
         Ok(())
     }
 
@@ -116,7 +164,17 @@ impl AudioEngine {
         self.base_position = self.position();
         self.started_at = None;
         if let Some(sink) = &self.sink {
-            sink.pause();
+            if self.bit_perfect {
+                sink.pause();
+            } else {
+                let current_volume = self.current_sink_volume();
+                self.fade = Some(VolumeFade::new(
+                    current_volume,
+                    0.0,
+                    PAUSE_FADE_DURATION,
+                    FadeAction::Pause,
+                ));
+            }
         }
         self.state = PlaybackState::Paused;
     }
@@ -127,6 +185,15 @@ impl AudioEngine {
         }
         self.started_at = Some(Instant::now());
         if let Some(sink) = &self.sink {
+            if !self.bit_perfect {
+                sink.set_volume(0.0);
+                self.fade = Some(VolumeFade::new(
+                    0.0,
+                    self.volume,
+                    PLAY_FADE_DURATION,
+                    FadeAction::None,
+                ));
+            }
             sink.play();
         }
         self.state = PlaybackState::Playing;
@@ -142,6 +209,7 @@ impl AudioEngine {
         self.base_position = Duration::ZERO;
         self.duration = None;
         self.bit_perfect = false;
+        self.fade = None;
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -149,8 +217,40 @@ impl AudioEngine {
         if let Some(sink) = &self.sink
             && !self.bit_perfect
         {
-            sink.set_volume(self.volume);
+            if let Some(fade) = &mut self.fade {
+                if fade.action == FadeAction::None {
+                    fade.target = self.volume;
+                }
+            } else {
+                sink.set_volume(self.volume);
+            }
         }
+    }
+
+    pub fn tick(&mut self) {
+        let Some(fade) = self.fade else {
+            return;
+        };
+
+        let volume = fade.volume_at(Instant::now());
+        if let Some(sink) = &self.sink {
+            sink.set_volume(volume);
+        }
+
+        if fade.finished(Instant::now()) {
+            if let Some(sink) = &self.sink {
+                sink.set_volume(fade.target);
+                if fade.action == FadeAction::Pause {
+                    sink.pause();
+                }
+            }
+            self.fade = None;
+        }
+    }
+
+    #[must_use]
+    pub fn is_fading(&self) -> bool {
+        self.fade.is_some()
     }
 
     #[must_use]
@@ -200,7 +300,56 @@ impl AudioEngine {
         self.base_position = Duration::ZERO;
         self.duration = None;
         self.sink = None;
+        self.fade = None;
         self.current_track.take()
+    }
+
+    fn current_sink_volume(&self) -> f32 {
+        self.fade
+            .map_or(if self.bit_perfect { 1.0 } else { self.volume }, |fade| {
+                fade.volume_at(Instant::now())
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FadeAction {
+    None,
+    Pause,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VolumeFade {
+    start: f32,
+    target: f32,
+    started_at: Instant,
+    duration: Duration,
+    action: FadeAction,
+}
+
+impl VolumeFade {
+    fn new(start: f32, target: f32, duration: Duration, action: FadeAction) -> Self {
+        Self {
+            start,
+            target,
+            started_at: Instant::now(),
+            duration,
+            action,
+        }
+    }
+
+    fn volume_at(&self, now: Instant) -> f32 {
+        if self.duration.is_zero() {
+            return self.target;
+        }
+
+        let progress = (now - self.started_at).as_secs_f32() / self.duration.as_secs_f32();
+        let eased = ease_out_cubic(progress.clamp(0.0, 1.0));
+        self.start + (self.target - self.start) * eased
+    }
+
+    fn finished(&self, now: Instant) -> bool {
+        now.duration_since(self.started_at) >= self.duration
     }
 }
 
@@ -515,6 +664,10 @@ impl Biquad {
 
 fn db_to_amp(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
 }
 
 #[cfg(test)]

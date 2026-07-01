@@ -6,8 +6,9 @@ use crate::config::{
     self, AppConfig, AppPaths, DISCORD_MODULE_ID, EQ_MODULE_ID, LASTFM_MODULE_ID,
     LOCAL_SOURCE_MODULE_ID, REPLAYGAIN_MODULE_ID, RepeatMode, ReplayGainMode,
 };
+use crate::icons::{Icon, draw_icon};
 use crate::integrations::IntegrationManager;
-use crate::library::{LocalMusicSource, format_duration, tracks_from_drop};
+use crate::library::{LocalMusicSource, format_duration, read_embedded_cover, tracks_from_drop};
 use crate::plugins::{DiscoveredModuleKind, PluginHost};
 use crate::theme::{AlloyTheme, ThemeCatalog, ThemeColors, apply_theme, configure_fonts};
 use alloy_core::{ModuleCategory, ModuleEvent, MusicSourceModule, Track};
@@ -37,7 +38,9 @@ pub struct AlloyApp {
     config_text_dirty: bool,
     settings_error: Option<String>,
     selected_chain_node: Option<String>,
-    cover_cache: BTreeMap<PathBuf, Option<egui::TextureHandle>>,
+    cover_cache: BTreeMap<String, Option<egui::TextureHandle>>,
+    volume_before_mute: f32,
+    volume_slider_open_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,18 +52,6 @@ enum SettingsTab {
     Config,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TransportIcon {
-    Previous,
-    Play,
-    Pause,
-    Next,
-    Stop,
-    Shuffle,
-    Repeat,
-    RepeatOne,
-}
-
 impl AlloyApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         let paths = AppPaths::discover()?;
@@ -70,8 +61,15 @@ impl AlloyApp {
         let mut config_changed = false;
 
         let themes = ThemeCatalog::load(&paths.themes_dir);
-        if themes.find(&config.active_theme).is_none() {
-            config.active_theme = themes.default_theme().definition.id.clone();
+        let prefers_dark = cc.egui_ctx.style().visuals.dark_mode;
+        if themes.find(&config.active_theme).is_none()
+            || (!prefers_dark && config.active_theme == "graphite")
+        {
+            config.active_theme = themes
+                .default_theme_for_mode(prefers_dark)
+                .definition
+                .id
+                .clone();
             config_changed = true;
         }
         let active_theme = themes
@@ -114,6 +112,7 @@ impl AlloyApp {
             format!("Loaded {} tracks", library.len())
         };
         let config_text = toml::to_string_pretty(&config).unwrap_or_default();
+        let volume_before_mute = config.volume.max(0.4);
 
         Ok(Self {
             paths,
@@ -137,6 +136,8 @@ impl AlloyApp {
             settings_error: None,
             selected_chain_node: Some(REPLAYGAIN_MODULE_ID.to_owned()),
             cover_cache: BTreeMap::new(),
+            volume_before_mute,
+            volume_slider_open_until: None,
         })
     }
 
@@ -361,7 +362,7 @@ impl AlloyApp {
 
         match audio.play(track.clone(), processor_factories, bit_perfect) {
             Ok(()) => {
-                self.status_line = "Playback started".to_owned();
+                self.status_line = "Playing".to_owned();
                 self.integrations
                     .dispatch(&ModuleEvent::PlaybackStarted { track });
             }
@@ -655,16 +656,33 @@ impl AlloyApp {
         }
     }
 
-    fn top_panel(&mut self, ui: &mut egui::Ui) {
+    fn top_panel(&mut self, ui: &mut egui::Ui, colors: ThemeColors) {
         ui.horizontal_centered(|ui| {
-            ui.label(egui::RichText::new("Alloy").strong().size(16.0));
-            ui.separator();
-            if ui.button("Settings").clicked() {
-                self.settings_open = true;
-                self.refresh_config_text();
-            }
+            ui.label(
+                egui::RichText::new("Alloy")
+                    .strong()
+                    .size(16.5)
+                    .color(colors.text),
+            );
+            ui.add_space(8.0);
+            stat_pill(ui, colors, &format!("{} tracks", self.library.len()));
+            stat_pill(
+                ui,
+                colors,
+                &format!("{} roots", self.config.library_paths.len()),
+            );
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(&self.status_line).small());
+                if top_icon_button(ui, Icon::Settings, "Settings").clicked() {
+                    self.settings_open = true;
+                    self.refresh_config_text();
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(&self.status_line)
+                        .small()
+                        .color(colors.muted_text),
+                );
             });
         });
     }
@@ -702,7 +720,7 @@ impl AlloyApp {
             settings_tab_button(ui, &mut self.settings_tab, SettingsTab::Modules, "Modules");
             settings_tab_button(ui, &mut self.settings_tab, SettingsTab::Config, "Config");
         });
-        ui.separator();
+        soft_separator(ui);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -716,109 +734,139 @@ impl AlloyApp {
     }
 
     fn settings_general_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = self.active_colors();
         ui.heading("General");
-        ui.label(format!("Config: {}", self.paths.config_file.display()));
         ui.add_space(8.0);
 
-        self.theme_ui(ui, ctx);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Config: {}", self.paths.config_file.display()))
+                    .color(colors.muted_text),
+            );
+            ui.add_space(8.0);
+            self.theme_ui(ui, ctx);
 
-        ui.add_space(10.0);
-        let mut changed = false;
-        changed |= thin_slider(
-            ui,
-            egui::Slider::new(&mut self.config.volume, 0.0..=1.5)
-                .text("Default volume")
-                .show_value(true),
-            360.0,
-        )
-        .changed();
-        if changed {
-            if let Some(audio) = &mut self.audio {
-                audio.set_volume(self.config.volume);
-            }
-            self.save_config();
-        }
-
-        ui.separator();
-        ui.label(egui::RichText::new("Album Covers").strong());
-        let mut cover_changed = false;
-        cover_changed |= ui
-            .checkbox(&mut self.config.cover_art.enabled, "Show album covers")
-            .changed();
-        cover_changed |= ui
-            .checkbox(
-                &mut self.config.cover_art.sidecar_images,
-                "Use sidecar images beside tracks",
+            ui.add_space(8.0);
+            let mut changed = false;
+            changed |= thin_slider(
+                ui,
+                egui::Slider::new(&mut self.config.volume, 0.0..=1.5)
+                    .text("Default volume")
+                    .show_value(true),
+                360.0,
             )
             .changed();
-        if cover_changed {
-            self.save_config();
-        }
+            if changed {
+                if self.config.volume > 0.01 {
+                    self.volume_before_mute = self.config.volume;
+                }
+                self.set_app_volume(self.config.volume);
+            }
+        });
 
-        ui.separator();
-        ui.label(egui::RichText::new("Library Paths").strong());
+        ui.add_space(10.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(egui::RichText::new("Album Covers").strong());
+            let mut cover_changed = false;
+            cover_changed |= ui
+                .checkbox(&mut self.config.cover_art.enabled, "Show album covers")
+                .changed();
+            cover_changed |= ui
+                .checkbox(
+                    &mut self.config.cover_art.sidecar_images,
+                    "Use sidecar images beside tracks",
+                )
+                .changed();
+            if cover_changed {
+                self.save_config();
+            }
+        });
+
+        ui.add_space(10.0);
         let paths = self.config.library_paths.clone();
-        for (index, path) in paths.iter().enumerate() {
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(egui::RichText::new("Library Paths").strong());
+            for (index, path) in paths.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(path.display().to_string());
+                    if ui.button("Remove").clicked() {
+                        self.config.library_paths.remove(index);
+                        self.save_config();
+                        self.rescan_library();
+                    }
+                });
+            }
             ui.horizontal(|ui| {
-                ui.label(path.display().to_string());
-                if ui.button("Remove").clicked() {
-                    self.config.library_paths.remove(index);
-                    self.save_config();
-                    self.rescan_library();
+                ui.text_edit_singleline(&mut self.path_entry);
+                if ui.button("Add").clicked() {
+                    self.add_path_from_entry();
+                }
+                if ui.button("Choose Folder...").clicked() {
+                    self.pick_library_folder();
+                }
+                if ui.button("Choose Files...").clicked() {
+                    self.pick_library_files();
                 }
             });
-        }
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.path_entry);
-            if ui.button("Add").clicked() {
-                self.add_path_from_entry();
-            }
-            if ui.button("Choose Folder...").clicked() {
-                self.pick_library_folder();
-            }
-            if ui.button("Choose Files...").clicked() {
-                self.pick_library_files();
-            }
         });
     }
 
     fn settings_audio_ui(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         ui.heading("Audio Chain");
-        let mut playback_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            playback_changed |= ui
-                .checkbox(&mut self.config.playback.bit_perfect, "Bit-perfect")
-                .changed();
-            playback_changed |= ui
-                .checkbox(&mut self.config.playback.shuffle, "Shuffle")
-                .changed();
-            ui.label("Repeat");
-            egui::ComboBox::from_id_salt("repeat-mode")
-                .selected_text(match self.config.playback.repeat {
-                    RepeatMode::None => "Off",
-                    RepeatMode::All => "All",
-                    RepeatMode::One => "One",
-                })
-                .show_ui(ui, |ui| {
-                    playback_changed |= ui
-                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::None, "Off")
-                        .changed();
-                    playback_changed |= ui
-                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::All, "All")
-                        .changed();
-                    playback_changed |= ui
-                        .selectable_value(&mut self.config.playback.repeat, RepeatMode::One, "One")
-                        .changed();
-                });
-        });
-        if playback_changed {
-            self.save_config();
-            self.status_line = "Playback settings saved".to_owned();
-        }
-        ui.separator();
-        ui.label("Processors run left to right when playback starts.");
         ui.add_space(8.0);
-        self.audio_chain_ui(ui);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            let mut playback_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                playback_changed |= ui
+                    .checkbox(&mut self.config.playback.bit_perfect, "Bit-perfect")
+                    .changed();
+                playback_changed |= ui
+                    .checkbox(&mut self.config.playback.shuffle, "Shuffle")
+                    .changed();
+                ui.label("Repeat");
+                egui::ComboBox::from_id_salt("repeat-mode")
+                    .selected_text(match self.config.playback.repeat {
+                        RepeatMode::None => "Off",
+                        RepeatMode::All => "All",
+                        RepeatMode::One => "One",
+                    })
+                    .show_ui(ui, |ui| {
+                        playback_changed |= ui
+                            .selectable_value(
+                                &mut self.config.playback.repeat,
+                                RepeatMode::None,
+                                "Off",
+                            )
+                            .changed();
+                        playback_changed |= ui
+                            .selectable_value(
+                                &mut self.config.playback.repeat,
+                                RepeatMode::All,
+                                "All",
+                            )
+                            .changed();
+                        playback_changed |= ui
+                            .selectable_value(
+                                &mut self.config.playback.repeat,
+                                RepeatMode::One,
+                                "One",
+                            )
+                            .changed();
+                    });
+            });
+            if playback_changed {
+                self.save_config();
+                self.status_line = "Playback settings saved".to_owned();
+            }
+        });
+
+        ui.add_space(10.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(egui::RichText::new("Processor Chain").strong());
+            ui.add_space(8.0);
+            self.audio_chain_ui(ui);
+        });
     }
 
     fn audio_chain_ui(&mut self, ui: &mut egui::Ui) {
@@ -856,7 +904,7 @@ impl AlloyApp {
                         }
 
                         if index + 1 < chain.len() {
-                            ui.label(egui::RichText::new("->").strong());
+                            chain_connector(ui, ui.visuals().weak_text_color());
                         }
                     }
                 });
@@ -916,7 +964,7 @@ impl AlloyApp {
             .collect::<Vec<_>>();
 
         if !available.is_empty() {
-            ui.separator();
+            soft_separator(ui);
             ui.label(egui::RichText::new("Available Processors").strong());
             for (id, name) in available {
                 ui.horizontal(|ui| {
@@ -940,23 +988,34 @@ impl AlloyApp {
     }
 
     fn settings_integrations_ui(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         ui.heading("Integrations");
-        self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Enable Last.fm");
-        self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Enable Discord RPC");
+        ui.add_space(8.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Enable Last.fm");
+            self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Enable Discord RPC");
+        });
 
-        ui.separator();
-        ui.label(egui::RichText::new("Last.fm").strong());
+        ui.add_space(10.0);
         let mut changed = false;
-        changed |= option_text_field(ui, "API key", &mut self.config.lastfm.api_key, false);
-        changed |= option_text_field(ui, "API secret", &mut self.config.lastfm.api_secret, true);
-        changed |= option_text_field(ui, "Session key", &mut self.config.lastfm.session_key, true);
-        changed |= ui
-            .checkbox(&mut self.config.lastfm.scrobble, "Scrobble played tracks")
-            .changed();
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(egui::RichText::new("Last.fm").strong());
+            changed |= option_text_field(ui, "API key", &mut self.config.lastfm.api_key, false);
+            changed |=
+                option_text_field(ui, "API secret", &mut self.config.lastfm.api_secret, true);
+            changed |=
+                option_text_field(ui, "Session key", &mut self.config.lastfm.session_key, true);
+            changed |= ui
+                .checkbox(&mut self.config.lastfm.scrobble, "Scrobble played tracks")
+                .changed();
+        });
 
-        ui.separator();
-        ui.label(egui::RichText::new("Discord").strong());
-        changed |= option_text_field(ui, "Client ID", &mut self.config.discord.client_id, false);
+        ui.add_space(10.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(egui::RichText::new("Discord").strong());
+            changed |=
+                option_text_field(ui, "Client ID", &mut self.config.discord.client_id, false);
+        });
 
         if changed {
             self.save_config();
@@ -965,52 +1024,65 @@ impl AlloyApp {
     }
 
     fn settings_modules_ui(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         ui.heading("Modules");
-        self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
-        self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
-        self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
-        self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
-        self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
-        ui.separator();
-        self.community_modules_ui(ui, self.active_colors());
+        ui.add_space(8.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
+            self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
+            self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
+            self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
+            self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
+        });
+        ui.add_space(10.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            self.community_modules_ui(ui, colors);
+        });
     }
 
     fn settings_config_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let colors = self.active_colors();
         ui.heading("alloy.toml");
-        ui.label(self.paths.config_file.display().to_string());
-        if let Some(error) = &self.settings_error {
-            ui.label(egui::RichText::new(error).color(self.active_colors().danger));
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Reload").clicked() {
-                match std::fs::read_to_string(&self.paths.config_file) {
-                    Ok(raw) => {
-                        self.config_text = raw;
-                        self.config_text_dirty = false;
-                        self.settings_error = None;
-                    }
-                    Err(err) => {
-                        self.settings_error = Some(format!("Could not reload config: {err}"));
+        ui.add_space(8.0);
+        section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(self.paths.config_file.display().to_string())
+                    .color(colors.muted_text),
+            );
+            if let Some(error) = &self.settings_error {
+                ui.label(egui::RichText::new(error).color(colors.danger));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Reload").clicked() {
+                    match std::fs::read_to_string(&self.paths.config_file) {
+                        Ok(raw) => {
+                            self.config_text = raw;
+                            self.config_text_dirty = false;
+                            self.settings_error = None;
+                        }
+                        Err(err) => {
+                            self.settings_error = Some(format!("Could not reload config: {err}"));
+                        }
                     }
                 }
-            }
-            if ui.button("Apply").clicked() {
-                self.apply_config_text(ctx);
-            }
-            if self.config_text_dirty {
-                ui.label("Unsaved edits");
+                if ui.button("Apply").clicked() {
+                    self.apply_config_text(ctx);
+                }
+                if self.config_text_dirty {
+                    ui.label(egui::RichText::new("Unsaved edits").color(colors.muted_text));
+                }
+            });
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.config_text)
+                        .desired_rows(22)
+                        .code_editor(),
+                )
+                .changed()
+            {
+                self.config_text_dirty = true;
             }
         });
-        if ui
-            .add(
-                egui::TextEdit::multiline(&mut self.config_text)
-                    .desired_rows(22)
-                    .code_editor(),
-            )
-            .changed()
-        {
-            self.config_text_dirty = true;
-        }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -1018,52 +1090,59 @@ impl AlloyApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(6.0);
                 ui.heading(egui::RichText::new("Alloy").size(28.0).color(colors.text));
                 ui.label(egui::RichText::new("Modular Rust music").color(colors.muted_text));
                 ui.add_space(14.0);
 
-                ui.horizontal(|ui| {
-                    if ui.button("Rescan").clicked() {
-                        self.rescan_library();
-                    }
-                    if ui.button("Save").clicked() {
+                section_heading(ui, "Library", colors);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Music path").color(colors.muted_text));
+                    let add_from_enter = ui
+                        .add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::TextEdit::singleline(&mut self.path_entry)
+                                .hint_text("Folder or audio file path"),
+                        )
+                        .lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.horizontal_wrapped(|ui| {
+                        if add_from_enter || ui.button("Add").clicked() {
+                            self.add_path_from_entry();
+                        }
+                        if ui.button("Choose...").clicked() {
+                            self.pick_library_folder();
+                        }
+                        if ui.button("Rescan").clicked() {
+                            self.rescan_library();
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        stat_pill(ui, colors, &format!("{} tracks", self.library.len()));
+                        stat_pill(
+                            ui,
+                            colors,
+                            &format!("{} roots", self.config.library_paths.len()),
+                        );
+                    });
+                });
+
+                ui.add_space(14.0);
+                section_heading(ui, "Modules", colors);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
+                    self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
+                    self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
+                    self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
+                    self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
+                    ui.add_space(4.0);
+                    if ui.button("Save config").clicked() {
                         self.save_config();
                     }
                 });
 
-                ui.add_space(10.0);
-                ui.label("Music path");
-                let add_from_enter = ui.text_edit_singleline(&mut self.path_entry).lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                ui.horizontal_wrapped(|ui| {
-                    if add_from_enter || ui.button("Add").clicked() {
-                        self.add_path_from_entry();
-                    }
-                    if ui.button("Choose...").clicked() {
-                        self.pick_library_folder();
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Library").strong());
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} tracks", self.library.len()));
-                    ui.separator();
-                    ui.label(format!("{} roots", self.config.library_paths.len()));
-                });
-
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Modules").strong());
-                self.module_toggle_ui(ui, LOCAL_SOURCE_MODULE_ID, "Local library");
-                self.module_toggle_ui(ui, REPLAYGAIN_MODULE_ID, "ReplayGain");
-                self.module_toggle_ui(ui, EQ_MODULE_ID, "Equalizer");
-                self.module_toggle_ui(ui, LASTFM_MODULE_ID, "Last.fm");
-                self.module_toggle_ui(ui, DISCORD_MODULE_ID, "Discord RPC");
-
-                ui.separator();
-                ui.label(egui::RichText::new(&self.status_line).color(colors.muted_text));
                 if let Some(error) = &self.audio_error {
+                    ui.add_space(12.0);
                     ui.label(egui::RichText::new(error).color(colors.danger));
                 }
             });
@@ -1074,32 +1153,47 @@ impl AlloyApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(4.0);
-                self.now_playing_ui(ui, ctx, colors);
-                ui.separator();
-                self.replay_gain_ui(ui);
-                ui.separator();
-                self.equalizer_ui(ui);
-                ui.separator();
-                self.theme_ui(ui, ctx);
-                ui.separator();
-                self.integration_ui(ui, colors);
-                ui.separator();
-                self.community_modules_ui(ui, colors);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.now_playing_ui(ui, ctx, colors);
+                });
+                ui.add_space(10.0);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.replay_gain_ui(ui);
+                });
+                ui.add_space(10.0);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.equalizer_ui(ui);
+                });
+                ui.add_space(10.0);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.theme_ui(ui, ctx);
+                });
+                ui.add_space(10.0);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.integration_ui(ui, colors);
+                });
+                ui.add_space(10.0);
+                section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                    self.community_modules_ui(ui, colors);
+                });
             });
     }
 
-    fn cover_texture(
-        &mut self,
-        ctx: &egui::Context,
-        cover_path: &PathBuf,
-    ) -> Option<egui::TextureHandle> {
-        if let Some(cached) = self.cover_cache.get(cover_path) {
+    fn cover_texture(&mut self, ctx: &egui::Context, track: &Track) -> Option<egui::TextureHandle> {
+        let cache_key = track.cover_path.as_ref().map_or_else(
+            || format!("embedded:{}", track.path.display()),
+            |path| format!("file:{}", path.display()),
+        );
+        if let Some(cached) = self.cover_cache.get(&cache_key) {
             return cached.clone();
         }
 
-        let texture = load_cover_texture(ctx, cover_path);
-        self.cover_cache.insert(cover_path.clone(), texture.clone());
+        let texture = if let Some(cover_path) = &track.cover_path {
+            load_cover_texture_from_path(ctx, cover_path)
+        } else {
+            load_embedded_cover_texture(ctx, &track.path)
+        };
+        self.cover_cache.insert(cache_key, texture.clone());
         texture
     }
 
@@ -1107,7 +1201,7 @@ impl AlloyApp {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        cover_path: Option<&PathBuf>,
+        track: Option<&Track>,
         size: f32,
     ) {
         if !self.config.cover_art.sidecar_images {
@@ -1115,12 +1209,12 @@ impl AlloyApp {
             return;
         }
 
-        let Some(cover_path) = cover_path else {
+        let Some(track) = track else {
             placeholder_cover(ui, size);
             return;
         };
 
-        let Some(texture) = self.cover_texture(ctx, cover_path) else {
+        let Some(texture) = self.cover_texture(ctx, track) else {
             placeholder_cover(ui, size);
             return;
         };
@@ -1143,40 +1237,75 @@ impl AlloyApp {
     }
 
     fn now_playing_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, colors: ThemeColors) {
-        ui.label(egui::RichText::new("Now Playing").strong());
         let snapshot = self.audio.as_ref().map(AudioEngine::snapshot);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Now Playing").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = snapshot
+                    .as_ref()
+                    .map_or("Idle", |snapshot| match snapshot.state {
+                        PlaybackState::Playing => "Playing",
+                        PlaybackState::Paused => "Paused",
+                        PlaybackState::Stopped => "Idle",
+                    });
+                state_pill(ui, colors, label, label == "Playing");
+            });
+        });
         if let Some(snapshot) = snapshot {
             if let Some(track) = snapshot.track.as_ref() {
+                ui.add_space(8.0);
                 if self.config.cover_art.enabled {
-                    self.cover_image_ui(ui, ctx, track.cover_path.as_ref(), 172.0);
-                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        self.cover_image_ui(ui, ctx, Some(track), 174.0);
+                    });
+                    ui.add_space(8.0);
                 }
-                ui.label(egui::RichText::new(&track.title).size(20.0).strong());
-                ui.label(egui::RichText::new(track.display_artist()).color(colors.muted_text));
-                ui.label(egui::RichText::new(track.path.display().to_string()).small());
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "{} / {}",
-                    format_duration(Some(snapshot.position)),
-                    format_duration(snapshot.duration)
-                ));
+                ui.add_sized(
+                    [ui.available_width(), 25.0],
+                    egui::Label::new(egui::RichText::new(&track.title).size(20.0).strong())
+                        .truncate(),
+                )
+                .on_hover_text(&track.title);
+                ui.add_sized(
+                    [ui.available_width(), 20.0],
+                    egui::Label::new(
+                        egui::RichText::new(track.display_artist()).color(colors.muted_text),
+                    )
+                    .truncate(),
+                );
+                let path = track.path.display().to_string();
+                ui.add_sized(
+                    [ui.available_width(), 18.0],
+                    egui::Label::new(egui::RichText::new(&path).small().color(colors.muted_text))
+                        .truncate(),
+                )
+                .on_hover_text(path);
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    stat_pill(ui, colors, &format_duration(Some(snapshot.position)));
+                    stat_pill(ui, colors, &format_duration(snapshot.duration));
+                });
                 return;
             }
         }
-        ui.label(egui::RichText::new("Idle").color(colors.muted_text));
+        ui.add_space(10.0);
+        empty_hint(ui, colors, "No track selected");
     }
 
     fn replay_gain_ui(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("ReplayGain").strong());
-            changed |= ui
-                .checkbox(&mut self.config.replay_gain.enabled, "Enabled")
-                .changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                changed |= ui
+                    .checkbox(&mut self.config.replay_gain.enabled, "Enabled")
+                    .changed();
+            });
         });
 
         if !self.config.module_enabled(REPLAYGAIN_MODULE_ID) {
-            ui.label("ReplayGain module disabled");
+            empty_hint(ui, colors, "ReplayGain module disabled");
             if changed {
                 self.save_config();
             }
@@ -1234,16 +1363,19 @@ impl AlloyApp {
     }
 
     fn equalizer_ui(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("EQ").strong());
-            changed |= ui
-                .checkbox(&mut self.config.equalizer.enabled, "Enabled")
-                .changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                changed |= ui
+                    .checkbox(&mut self.config.equalizer.enabled, "Enabled")
+                    .changed();
+            });
         });
 
         if !self.config.module_enabled(EQ_MODULE_ID) {
-            ui.label("Equalizer module disabled");
+            empty_hint(ui, colors, "Equalizer module disabled");
             if changed {
                 self.save_config();
             }
@@ -1323,24 +1455,23 @@ impl AlloyApp {
         ui.label(egui::RichText::new("Integrations").strong());
         for status in self.integrations.statuses() {
             ui.horizontal(|ui| {
-                let color = if status.enabled && status.configured {
-                    colors.accent
-                } else {
-                    colors.muted_text
-                };
-                ui.label(egui::RichText::new(status.name).color(color))
+                let ready = status.enabled && status.configured;
+                status_dot(ui, colors, ready);
+                ui.label(egui::RichText::new(status.name).strong())
                     .on_hover_text(status.id);
-                ui.label(if status.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if status.enabled && !status.configured {
+                        state_pill(ui, colors, "Needs config", false);
+                    } else if status.enabled {
+                        state_pill(ui, colors, "Enabled", ready);
+                    } else {
+                        state_pill(ui, colors, "Disabled", false);
+                    }
                 });
-                if status.enabled && !status.configured {
-                    ui.label(egui::RichText::new("needs config").color(colors.danger));
-                }
             });
         }
         if let Some(error) = self.integrations.last_error() {
+            ui.add_space(4.0);
             ui.label(egui::RichText::new(error).color(colors.danger));
         }
     }
@@ -1348,7 +1479,7 @@ impl AlloyApp {
     fn community_modules_ui(&mut self, ui: &mut egui::Ui, colors: ThemeColors) {
         ui.label(egui::RichText::new("Community Modules").strong());
         if self.plugins.modules().is_empty() {
-            ui.label(egui::RichText::new("None installed").color(colors.muted_text));
+            empty_hint(ui, colors, "None installed");
             return;
         }
 
@@ -1384,18 +1515,21 @@ impl AlloyApp {
                             self.status_line =
                                 "Module changes apply on next playback start".to_owned();
                         }
-                        ui.label(egui::RichText::new(name).strong())
-                            .on_hover_text(path);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(name).strong())
+                                .on_hover_text(path);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} | {} | {}",
+                                    version,
+                                    category_name(category),
+                                    kind
+                                ))
+                                .small()
+                                .color(colors.muted_text),
+                            );
+                        });
                     });
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} | {} | {}",
-                            version,
-                            category_name(category),
-                            kind
-                        ))
-                        .color(colors.muted_text),
-                    );
                 }
             });
     }
@@ -1410,16 +1544,24 @@ impl AlloyApp {
         ui.add_space(8.0);
 
         if self.library.is_empty() {
-            ui.vertical_centered_justified(|ui| {
-                ui.add_space(120.0);
-                ui.label(egui::RichText::new("No tracks loaded").size(22.0).strong());
-                ui.label(
-                    egui::RichText::new(
-                        "Add a folder from the left panel or drop audio files here",
-                    )
-                    .color(colors.muted_text),
-                );
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), ui.available_height()),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    section_frame(colors, ui.visuals().dark_mode).show(ui, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.vertical_centered(|ui| {
+                            placeholder_cover(ui, 86.0);
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("No tracks loaded").size(22.0).strong());
+                            ui.label(
+                                egui::RichText::new("Drop audio files here or choose a folder")
+                                    .color(colors.muted_text),
+                            );
+                        });
+                    });
+                },
+            );
             return;
         }
 
@@ -1427,69 +1569,87 @@ impl AlloyApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("track-grid")
-                    .num_columns(5)
-                    .spacing([16.0, 8.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Art").strong().color(colors.muted_text));
-                        ui.label(
-                            egui::RichText::new("Title")
-                                .strong()
-                                .color(colors.muted_text),
-                        );
-                        ui.label(
-                            egui::RichText::new("Artist")
-                                .strong()
-                                .color(colors.muted_text),
-                        );
-                        ui.label(
-                            egui::RichText::new("Album")
-                                .strong()
-                                .color(colors.muted_text),
-                        );
-                        ui.label(
-                            egui::RichText::new("Time")
-                                .strong()
-                                .color(colors.muted_text),
-                        );
-                        ui.end_row();
-
-                        for index in indices {
-                            let (title, artist, album, duration, path, cover_path) = {
-                                let track = &self.library[index];
-                                (
-                                    track.title.clone(),
-                                    track.display_artist().to_owned(),
-                                    track.display_album().to_owned(),
-                                    track.duration,
-                                    track.path.display().to_string(),
-                                    track.cover_path.clone(),
-                                )
-                            };
-                            let selected = self.selected_track == Some(index);
-                            if self.config.cover_art.enabled {
-                                self.cover_image_ui(ui, ctx, cover_path.as_ref(), 34.0);
-                            } else {
-                                ui.label("");
-                            }
-                            let response = ui.selectable_label(selected, title).on_hover_text(path);
-                            if response.clicked() {
-                                self.selected_track = Some(index);
-                            }
-                            if response.double_clicked() {
-                                self.play_index(index);
-                            }
-                            ui.label(artist);
-                            ui.label(album);
-                            ui.label(format_duration(duration));
-                            ui.end_row();
-                        }
-                    });
+                let columns =
+                    TrackColumns::new(ui.available_width(), self.config.cover_art.enabled);
+                track_header_ui(ui, colors, columns);
+                ui.add_space(4.0);
+                for index in indices {
+                    self.track_row_ui(ui, ctx, colors, columns, index);
+                }
             });
     }
 
+    fn track_row_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        colors: ThemeColors,
+        columns: TrackColumns,
+        index: usize,
+    ) {
+        let (track, title, artist, album, duration, path, playing) = {
+            let track = &self.library[index];
+            let playing = self
+                .audio
+                .as_ref()
+                .and_then(AudioEngine::current_track)
+                .is_some_and(|current| current.id == track.id);
+            (
+                track.clone(),
+                track.title.clone(),
+                track.display_artist().to_owned(),
+                track.display_album().to_owned(),
+                track.duration,
+                track.path.display().to_string(),
+                playing,
+            )
+        };
+        let selected = self.selected_track == Some(index);
+        let row_height = 42.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::click(),
+        );
+        let response = response.on_hover_text(path);
+
+        if let Some(fill) = track_row_fill(ui, colors, selected, playing, response.hovered()) {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(7), fill);
+        }
+
+        let content_rect = rect.shrink2(egui::vec2(8.0, 4.0));
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("track-row", index)),
+        );
+        row_ui.spacing_mut().item_spacing.x = TrackColumns::GAP;
+
+        if self.config.cover_art.enabled {
+            self.cover_image_ui(&mut row_ui, ctx, Some(&track), 34.0);
+        }
+
+        row_label(&mut row_ui, title, columns.title, playing);
+        row_label(&mut row_ui, artist, columns.artist, playing);
+        row_label(&mut row_ui, album, columns.album, playing);
+        row_label(
+            &mut row_ui,
+            format_duration(duration),
+            columns.duration,
+            playing,
+        );
+
+        if response.clicked() {
+            self.selected_track = Some(index);
+        }
+        if response.double_clicked() {
+            self.play_index(index);
+        }
+    }
+
     fn transport_panel(&mut self, ui: &mut egui::Ui) {
+        let colors = self.active_colors();
         let snapshot = self.audio.as_ref().map(AudioEngine::snapshot);
         let state = snapshot
             .as_ref()
@@ -1516,21 +1676,16 @@ impl AlloyApp {
             egui::vec2(ui.available_width(), ui.available_height()),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                if transport_icon_button(
-                    ui,
-                    TransportIcon::Shuffle,
-                    "Shuffle",
-                    self.config.playback.shuffle,
-                )
-                .clicked()
+                if transport_icon_button(ui, Icon::Shuffle, "Shuffle", self.config.playback.shuffle)
+                    .clicked()
                 {
                     self.config.playback.shuffle = !self.config.playback.shuffle;
                     self.save_config();
                 }
                 let repeat_icon = if self.config.playback.repeat == RepeatMode::One {
-                    TransportIcon::RepeatOne
+                    Icon::Repeat1
                 } else {
-                    TransportIcon::Repeat
+                    Icon::Repeat
                 };
                 if transport_icon_button(
                     ui,
@@ -1548,20 +1703,15 @@ impl AlloyApp {
                     self.save_config();
                 }
 
-                ui.separator();
-                if transport_icon_button(
-                    ui,
-                    TransportIcon::Previous,
-                    "Restart or previous track",
-                    false,
-                )
-                .clicked()
+                transport_separator(ui);
+                if transport_icon_button(ui, Icon::SkipBack, "Restart or previous track", false)
+                    .clicked()
                 {
                     self.rewind_or_previous();
                 }
                 let play_icon = match state {
-                    PlaybackState::Playing => TransportIcon::Pause,
-                    PlaybackState::Paused | PlaybackState::Stopped => TransportIcon::Play,
+                    PlaybackState::Playing => Icon::Pause,
+                    PlaybackState::Paused | PlaybackState::Stopped => Icon::Play,
                 };
                 let play_tip = match state {
                     PlaybackState::Playing => "Pause",
@@ -1570,17 +1720,15 @@ impl AlloyApp {
                 if transport_icon_button(ui, play_icon, play_tip, false).clicked() {
                     self.toggle_playback();
                 }
-                if transport_icon_button(ui, TransportIcon::Next, "Next track", false).clicked() {
+                if transport_icon_button(ui, Icon::SkipForward, "Next track", false).clicked() {
                     self.play_next();
                 }
-                if show_stop
-                    && transport_icon_button(ui, TransportIcon::Stop, "Stop", false).clicked()
-                {
+                if show_stop && transport_icon_button(ui, Icon::Square, "Stop", false).clicked() {
                     self.stop();
                 }
 
                 if progress_width > 0.0 {
-                    ui.separator();
+                    transport_separator(ui);
                     if show_time {
                         ui.label(format_duration(Some(position)));
                     }
@@ -1604,67 +1752,380 @@ impl AlloyApp {
                     }
                 }
 
-                ui.separator();
+                transport_separator(ui);
                 if self.config.playback.bit_perfect {
-                    ui.label("Bit-perfect");
-                } else if show_volume {
-                    ui.label("Volume");
-                    let mut new_volume = volume;
-                    if thin_slider(
-                        ui,
-                        egui::Slider::new(&mut new_volume, 0.0..=1.5).show_value(false),
-                        120.0,
-                    )
-                    .changed()
-                    {
-                        self.config.volume = new_volume;
-                        if let Some(audio) = &mut self.audio {
-                            audio.set_volume(new_volume);
-                        }
-                        self.save_config();
-                    }
+                    state_pill(ui, colors, "Bit-perfect", true);
                 } else {
-                    ui.label(format!("{:.0}%", volume * 100.0));
+                    self.volume_control_ui(ui, volume, show_volume);
                 }
             },
         );
+    }
+
+    fn volume_control_ui(&mut self, ui: &mut egui::Ui, volume: f32, force_slider: bool) {
+        let muted = volume <= 0.01;
+        let icon = if muted {
+            Icon::VolumeX
+        } else if volume < 0.7 {
+            Icon::Volume1
+        } else {
+            Icon::Volume2
+        };
+        let response = transport_icon_button(ui, icon, "Mute / unmute", muted);
+        if response.hovered() {
+            self.volume_slider_open_until = Some(Instant::now() + Duration::from_millis(900));
+        }
+        if response.clicked() {
+            if muted {
+                let restored = self.volume_before_mute.clamp(0.05, 1.5);
+                self.set_app_volume(restored);
+            } else {
+                self.volume_before_mute = volume.max(0.05);
+                self.set_app_volume(0.0);
+            }
+        }
+
+        let slider_open = force_slider
+            || self
+                .volume_slider_open_until
+                .is_some_and(|until| until > Instant::now());
+        if slider_open {
+            let mut new_volume = self.config.volume;
+            let slider = thin_slider(
+                ui,
+                egui::Slider::new(&mut new_volume, 0.0..=1.5).show_value(false),
+                124.0,
+            );
+            if slider.hovered() || slider.dragged() {
+                self.volume_slider_open_until = Some(Instant::now() + Duration::from_millis(900));
+            }
+            if slider.changed() {
+                if new_volume > 0.01 {
+                    self.volume_before_mute = new_volume;
+                }
+                self.set_app_volume(new_volume);
+            }
+        } else {
+            ui.label(format!("{:.0}%", volume * 100.0));
+        }
+    }
+
+    fn set_app_volume(&mut self, volume: f32) {
+        self.config.volume = volume.clamp(0.0, 1.5);
+        if let Some(audio) = &mut self.audio {
+            audio.set_volume(self.config.volume);
+        }
+        self.save_config();
     }
 }
 
 impl eframe::App for AlloyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
+        if let Some(audio) = &mut self.audio {
+            audio.tick();
+        }
         self.check_finished_track();
         self.dispatch_position_event();
 
+        let colors = self.active_colors();
+        let dark_mode = ctx.style().visuals.dark_mode;
+
         egui::TopBottomPanel::top("alloy-top-bar")
             .resizable(false)
-            .exact_height(42.0)
-            .show(ctx, |ui| self.top_panel(ui));
+            .exact_height(48.0)
+            .frame(app_panel_frame(
+                colors.panel,
+                dark_mode,
+                egui::Margin::symmetric(14, 7),
+            ))
+            .show(ctx, |ui| self.top_panel(ui, colors));
 
         self.settings_window(ctx);
 
         egui::SidePanel::left("alloy-side-panel")
             .resizable(false)
-            .exact_width(235.0)
+            .exact_width(252.0)
+            .frame(app_panel_frame(
+                colors.surface,
+                dark_mode,
+                egui::Margin::symmetric(14, 14),
+            ))
             .show(ctx, |ui| self.side_panel(ui));
 
         egui::SidePanel::right("alloy-right-panel")
             .resizable(true)
-            .default_width(310.0)
-            .width_range(270.0..=390.0)
+            .default_width(326.0)
+            .width_range(286.0..=410.0)
+            .frame(app_panel_frame(
+                colors.surface,
+                dark_mode,
+                egui::Margin::symmetric(12, 14),
+            ))
             .show(ctx, |ui| self.right_panel(ui, ctx));
 
         egui::TopBottomPanel::bottom("alloy-transport")
             .resizable(false)
-            .exact_height(66.0)
+            .exact_height(72.0)
+            .frame(app_panel_frame(
+                colors.panel,
+                dark_mode,
+                egui::Margin::symmetric(14, 8),
+            ))
             .show(ctx, |ui| self.transport_panel(ui));
 
-        let colors = self.active_colors();
-        egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui, ctx, colors));
+        egui::CentralPanel::default()
+            .frame(central_panel_frame(colors))
+            .show(ctx, |ui| self.central_panel(ui, ctx, colors));
 
-        ctx.request_repaint_after(Duration::from_millis(250));
+        let repaint_after = if self.audio.as_ref().is_some_and(AudioEngine::is_fading) {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(repaint_after);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackColumns {
+    art: f32,
+    title: f32,
+    artist: f32,
+    album: f32,
+    duration: f32,
+}
+
+impl TrackColumns {
+    const GAP: f32 = 12.0;
+
+    fn new(width: f32, show_art: bool) -> Self {
+        let content_width = (width - 16.0).max(320.0);
+        let art = if show_art { 34.0 } else { 0.0 };
+        let duration = 62.0;
+        let gap_count = if show_art { 4.0 } else { 3.0 };
+        let flexible = (content_width - art - duration - Self::GAP * gap_count).max(220.0);
+        let title = (flexible * 0.43).max(130.0);
+        let artist = (flexible * 0.27).max(92.0);
+        let album = (flexible - title - artist).max(92.0);
+
+        Self {
+            art,
+            title,
+            artist,
+            album,
+            duration,
+        }
+    }
+}
+
+fn track_header_ui(ui: &mut egui::Ui, colors: ThemeColors, columns: TrackColumns) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let content_rect = rect.shrink2(egui::vec2(8.0, 2.0));
+    let mut header_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt("track-header-row"),
+    );
+    header_ui.spacing_mut().item_spacing.x = TrackColumns::GAP;
+
+    if columns.art > 0.0 {
+        header_cell(&mut header_ui, "Art", columns.art, colors);
+    }
+    header_cell(&mut header_ui, "Title", columns.title, colors);
+    header_cell(&mut header_ui, "Artist", columns.artist, colors);
+    header_cell(&mut header_ui, "Album", columns.album, colors);
+    header_cell(&mut header_ui, "Time", columns.duration, colors);
+}
+
+fn header_cell(ui: &mut egui::Ui, text: &str, width: f32, colors: ThemeColors) {
+    ui.add_sized(
+        [width, 20.0],
+        egui::Label::new(egui::RichText::new(text).strong().color(colors.muted_text)).truncate(),
+    );
+}
+
+fn row_label(ui: &mut egui::Ui, text: String, width: f32, strong: bool) {
+    let text = if strong {
+        egui::RichText::new(text).strong()
+    } else {
+        egui::RichText::new(text)
+    };
+    ui.add_sized([width, 22.0], egui::Label::new(text).truncate());
+}
+
+fn track_row_fill(
+    ui: &egui::Ui,
+    colors: ThemeColors,
+    selected: bool,
+    playing: bool,
+    hovered: bool,
+) -> Option<egui::Color32> {
+    if playing {
+        return Some(with_alpha(
+            colors.accent,
+            if ui.visuals().dark_mode { 52 } else { 38 },
+        ));
+    }
+    if selected {
+        return Some(with_alpha(
+            colors.accent,
+            if ui.visuals().dark_mode { 34 } else { 26 },
+        ));
+    }
+    hovered.then_some(ui.visuals().widgets.hovered.bg_fill)
+}
+
+fn with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn app_panel_frame(fill: egui::Color32, dark_mode: bool, margin: egui::Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(panel_stroke(dark_mode))
+        .inner_margin(margin)
+}
+
+fn central_panel_frame(colors: ThemeColors) -> egui::Frame {
+    egui::Frame::new()
+        .fill(colors.background)
+        .inner_margin(egui::Margin::symmetric(16, 14))
+}
+
+fn section_frame(colors: ThemeColors, dark_mode: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(colors.panel)
+        .stroke(panel_stroke(dark_mode))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+}
+
+fn panel_stroke(dark_mode: bool) -> egui::Stroke {
+    egui::Stroke::new(
+        1.0,
+        if dark_mode {
+            egui::Color32::from_white_alpha(18)
+        } else {
+            egui::Color32::from_black_alpha(18)
+        },
+    )
+}
+
+fn section_heading(ui: &mut egui::Ui, label: &str, colors: ThemeColors) {
+    ui.label(
+        egui::RichText::new(label)
+            .small()
+            .strong()
+            .color(colors.muted_text),
+    );
+    ui.add_space(4.0);
+}
+
+fn stat_pill(ui: &mut egui::Ui, colors: ThemeColors, text: &str) {
+    let fill = if ui.visuals().dark_mode {
+        colors.surface_muted
+    } else {
+        colors.surface
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(panel_stroke(ui.visuals().dark_mode))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).small().color(colors.muted_text));
+        });
+}
+
+fn state_pill(ui: &mut egui::Ui, colors: ThemeColors, text: &str, active: bool) {
+    let fill = if active {
+        with_alpha(colors.accent, if ui.visuals().dark_mode { 46 } else { 34 })
+    } else if ui.visuals().dark_mode {
+        colors.surface_muted
+    } else {
+        colors.surface
+    };
+    let text_color = if active {
+        colors.accent
+    } else {
+        colors.muted_text
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(panel_stroke(ui.visuals().dark_mode))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).small().strong().color(text_color));
+        });
+}
+
+fn status_dot(ui: &mut egui::Ui, colors: ThemeColors, active: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 18.0), egui::Sense::hover());
+    let color = if active {
+        colors.accent
+    } else {
+        colors.muted_text
+    };
+    ui.painter()
+        .circle_filled(rect.center(), 3.5, with_alpha(color, 210));
+}
+
+fn empty_hint(ui: &mut egui::Ui, colors: ThemeColors, text: &str) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).color(colors.muted_text));
+}
+
+fn soft_separator(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+    let color = if ui.visuals().dark_mode {
+        egui::Color32::from_white_alpha(14)
+    } else {
+        egui::Color32::from_black_alpha(14)
+    };
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+fn transport_separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 28.0), egui::Sense::hover());
+    let color = if ui.visuals().dark_mode {
+        egui::Color32::from_white_alpha(18)
+    } else {
+        egui::Color32::from_black_alpha(18)
+    };
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.center().x, rect.top() + 5.0),
+            egui::pos2(rect.center().x, rect.bottom() - 5.0),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+fn top_icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &'static str) -> egui::Response {
+    let response = ui
+        .add_sized(
+            [34.0, 32.0],
+            egui::Button::new("").corner_radius(egui::CornerRadius::same(8)),
+        )
+        .on_hover_text(tooltip);
+    let color = if response.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    draw_icon(ui.painter(), response.rect.shrink(8.0), icon, color);
+    response
 }
 
 fn format_band(frequency_hz: f32) -> String {
@@ -1676,9 +2137,32 @@ fn format_band(frequency_hz: f32) -> String {
 }
 
 fn settings_tab_button(ui: &mut egui::Ui, active: &mut SettingsTab, tab: SettingsTab, label: &str) {
-    if ui.selectable_label(*active == tab, label).clicked() {
+    let width = match tab {
+        SettingsTab::Audio | SettingsTab::Integrations => 112.0,
+        SettingsTab::General | SettingsTab::Modules => 84.0,
+        SettingsTab::Config => 72.0,
+    };
+    if ui
+        .add_sized(
+            [width, 30.0],
+            egui::Button::selectable(*active == tab, label)
+                .corner_radius(egui::CornerRadius::same(8)),
+        )
+        .clicked()
+    {
         *active = tab;
     }
+}
+
+fn chain_connector(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 38.0), egui::Sense::hover());
+    let center_y = rect.center().y;
+    let stroke = egui::Stroke::new(1.5, color);
+    let left = egui::pos2(rect.left() + 4.0, center_y);
+    let right = egui::pos2(rect.right() - 4.0, center_y);
+    ui.painter().line_segment([left, right], stroke);
+    ui.painter().circle_filled(left, 2.0, color);
+    ui.painter().circle_filled(right, 2.0, color);
 }
 
 fn thin_slider<'a>(ui: &mut egui::Ui, slider: egui::Slider<'a>, width: f32) -> egui::Response {
@@ -1703,8 +2187,19 @@ const fn platform_slider_height() -> f32 {
 
 fn search_field(ui: &mut egui::Ui, search: &mut String, colors: ThemeColors) {
     let width = ui.available_width().min(310.0).max(210.0);
+    let fill = if ui.visuals().dark_mode {
+        colors.surface_muted
+    } else {
+        colors.panel
+    };
+    let stroke = if ui.visuals().dark_mode {
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(18))
+    };
     egui::Frame::new()
-        .fill(colors.surface_muted)
+        .fill(fill)
+        .stroke(stroke)
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(10, 5))
         .show(ui, |ui| {
@@ -1724,15 +2219,7 @@ fn search_field(ui: &mut egui::Ui, search: &mut String, colors: ThemeColors) {
 }
 
 fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let center = egui::pos2(rect.left() + 7.5, rect.center().y - 1.5);
-    painter.circle_stroke(center, 5.0, egui::Stroke::new(1.7, color));
-    painter.line_segment(
-        [
-            egui::pos2(center.x + 3.8, center.y + 3.8),
-            egui::pos2(rect.right() - 2.0, rect.bottom() - 3.0),
-        ],
-        egui::Stroke::new(1.7, color),
-    );
+    draw_icon(painter, rect, Icon::Search, color);
 }
 
 fn option_text_field(
@@ -1762,16 +2249,32 @@ fn option_text_field(
     changed
 }
 
-fn load_cover_texture(ctx: &egui::Context, cover_path: &PathBuf) -> Option<egui::TextureHandle> {
+fn load_cover_texture_from_path(
+    ctx: &egui::Context,
+    cover_path: &PathBuf,
+) -> Option<egui::TextureHandle> {
     let image = image::ImageReader::open(cover_path).ok()?.decode().ok()?;
+    load_cover_texture_from_image(ctx, format!("cover:{}", cover_path.display()), image)
+}
+
+fn load_embedded_cover_texture(
+    ctx: &egui::Context,
+    track_path: &PathBuf,
+) -> Option<egui::TextureHandle> {
+    let bytes = read_embedded_cover(track_path)?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    load_cover_texture_from_image(ctx, format!("embedded:{}", track_path.display()), image)
+}
+
+fn load_cover_texture_from_image(
+    ctx: &egui::Context,
+    name: String,
+    image: image::DynamicImage,
+) -> Option<egui::TextureHandle> {
     let image = image.thumbnail(768, 768).to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-    Some(ctx.load_texture(
-        format!("cover:{}", cover_path.display()),
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
+    Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
 }
 
 fn placeholder_cover(ui: &mut egui::Ui, size: f32) {
@@ -1804,7 +2307,7 @@ fn placeholder_cover(ui: &mut egui::Ui, size: f32) {
 
 fn transport_icon_button(
     ui: &mut egui::Ui,
-    icon: TransportIcon,
+    icon: Icon,
     tooltip: &'static str,
     active: bool,
 ) -> egui::Response {
@@ -1820,177 +2323,8 @@ fn transport_icon_button(
     } else {
         ui.visuals().text_color()
     };
-    draw_transport_icon(ui.painter(), response.rect, icon, color);
+    draw_icon(ui.painter(), response.rect.shrink(9.0), icon, color);
     response
-}
-
-fn draw_transport_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    icon: TransportIcon,
-    color: egui::Color32,
-) {
-    let rect = rect.shrink2(egui::vec2(11.0, 9.0));
-    let center_y = rect.center().y;
-    match icon {
-        TransportIcon::Play => {
-            let points = vec![
-                egui::pos2(rect.left() + 3.0, rect.top()),
-                egui::pos2(rect.left() + 3.0, rect.bottom()),
-                egui::pos2(rect.right(), center_y),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                points,
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        TransportIcon::Pause => {
-            let bar_width = rect.width() * 0.28;
-            let gap = rect.width() * 0.18;
-            let left = egui::Rect::from_min_max(
-                rect.left_top(),
-                egui::pos2(rect.left() + bar_width, rect.bottom()),
-            );
-            let right = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + bar_width + gap, rect.top()),
-                egui::pos2(rect.left() + bar_width * 2.0 + gap, rect.bottom()),
-            );
-            painter.rect_filled(left, 2, color);
-            painter.rect_filled(right, 2, color);
-        }
-        TransportIcon::Stop => {
-            let square = egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0));
-            painter.rect_filled(square, 3, color);
-        }
-        TransportIcon::Previous => {
-            let bar = egui::Rect::from_min_max(
-                rect.left_top(),
-                egui::pos2(rect.left() + 2.5, rect.bottom()),
-            );
-            painter.rect_filled(bar, 1, color);
-            let first = vec![
-                egui::pos2(rect.left() + 4.5, center_y),
-                egui::pos2(rect.center().x + 1.5, rect.top()),
-                egui::pos2(rect.center().x + 1.5, rect.bottom()),
-            ];
-            let second = vec![
-                egui::pos2(rect.center().x, center_y),
-                egui::pos2(rect.right(), rect.top()),
-                egui::pos2(rect.right(), rect.bottom()),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                first,
-                color,
-                egui::Stroke::NONE,
-            ));
-            painter.add(egui::Shape::convex_polygon(
-                second,
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        TransportIcon::Next => {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.right() - 2.5, rect.top()),
-                rect.right_bottom(),
-            );
-            painter.rect_filled(bar, 1, color);
-            let first = vec![
-                egui::pos2(rect.left(), rect.top()),
-                egui::pos2(rect.left(), rect.bottom()),
-                egui::pos2(rect.center().x, center_y),
-            ];
-            let second = vec![
-                egui::pos2(rect.center().x - 1.5, rect.top()),
-                egui::pos2(rect.center().x - 1.5, rect.bottom()),
-                egui::pos2(rect.right() - 4.5, center_y),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                first,
-                color,
-                egui::Stroke::NONE,
-            ));
-            painter.add(egui::Shape::convex_polygon(
-                second,
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        TransportIcon::Shuffle => {
-            let stroke = egui::Stroke::new(2.0, color);
-            let left_top = egui::pos2(rect.left(), rect.top() + rect.height() * 0.28);
-            let left_bottom = egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.28);
-            let right_top = egui::pos2(rect.right() - 4.0, rect.top() + rect.height() * 0.25);
-            let right_bottom = egui::pos2(rect.right() - 4.0, rect.bottom() - rect.height() * 0.25);
-            painter.line_segment([left_top, rect.center()], stroke);
-            painter.line_segment([rect.center(), right_bottom], stroke);
-            painter.line_segment(
-                [left_bottom, egui::pos2(rect.center().x, left_bottom.y)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(rect.center().x, left_bottom.y), right_top],
-                stroke,
-            );
-            draw_arrow_head(painter, right_top, true, color);
-            draw_arrow_head(painter, right_bottom, true, color);
-        }
-        TransportIcon::Repeat | TransportIcon::RepeatOne => {
-            let stroke = egui::Stroke::new(2.0, color);
-            let top_y = rect.top() + rect.height() * 0.28;
-            let bottom_y = rect.bottom() - rect.height() * 0.28;
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 4.0, top_y),
-                    egui::pos2(rect.right() - 5.0, top_y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.right() - 4.0, bottom_y),
-                    egui::pos2(rect.left() + 5.0, bottom_y),
-                ],
-                stroke,
-            );
-            draw_arrow_head(painter, egui::pos2(rect.right() - 4.0, top_y), true, color);
-            draw_arrow_head(
-                painter,
-                egui::pos2(rect.left() + 4.0, bottom_y),
-                false,
-                color,
-            );
-            if matches!(icon, TransportIcon::RepeatOne) {
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "1",
-                    egui::FontId::proportional(12.0),
-                    color,
-                );
-            }
-        }
-    }
-}
-
-fn draw_arrow_head(
-    painter: &egui::Painter,
-    tip: egui::Pos2,
-    points_right: bool,
-    color: egui::Color32,
-) {
-    let direction = if points_right { 1.0 } else { -1.0 };
-    let points = vec![
-        tip,
-        egui::pos2(tip.x - direction * 5.0, tip.y - 4.0),
-        egui::pos2(tip.x - direction * 5.0, tip.y + 4.0),
-    ];
-    painter.add(egui::Shape::convex_polygon(
-        points,
-        color,
-        egui::Stroke::NONE,
-    ));
 }
 
 fn category_name(category: alloy_core::ModuleCategory) -> &'static str {

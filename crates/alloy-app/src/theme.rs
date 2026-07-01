@@ -2,7 +2,7 @@ use alloy_core::{ModuleCategory, ModuleManifest, ThemeDefinition, ThemeMode};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, TextStyle, Visuals};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct AlloyTheme {
@@ -38,34 +38,86 @@ impl ThemeCatalog {
             .or_else(|| self.themes.first())
             .expect("built-in themes are always present")
     }
+
+    #[must_use]
+    pub fn default_theme_for_mode(&self, dark_mode: bool) -> &AlloyTheme {
+        let id = if dark_mode { "graphite" } else { "linen" };
+        self.find(id).unwrap_or_else(|| self.default_theme())
+    }
 }
 
 pub fn apply_theme(ctx: &egui::Context, theme: &AlloyTheme) {
     let colors = ThemeColors::from_definition(&theme.definition);
+    let dark_mode = matches!(theme.definition.mode, ThemeMode::Dark);
     let mut visuals = match theme.definition.mode {
         ThemeMode::Dark => Visuals::dark(),
         ThemeMode::Light => Visuals::light(),
     };
 
-    visuals.panel_fill = colors.surface;
+    let hairline = hairline_stroke(dark_mode);
+    let quiet_hairline = quiet_hairline_stroke(dark_mode);
+
+    visuals.panel_fill = colors.background;
     visuals.window_fill = colors.panel;
     visuals.extreme_bg_color = colors.background;
     visuals.faint_bg_color = colors.surface_muted;
-    visuals.widgets.noninteractive.bg_fill = colors.panel;
-    visuals.widgets.inactive.bg_fill = colors.surface_muted;
+    visuals.text_edit_bg_color = Some(colors.surface);
+    visuals.code_bg_color = colors.surface_muted;
+    visuals.warn_fg_color = colors.accent;
+    visuals.error_fg_color = colors.danger;
+    visuals.weak_text_color = Some(colors.muted_text);
+
+    visuals.widgets.noninteractive.bg_fill = colors.background;
+    visuals.widgets.noninteractive.weak_bg_fill = colors.surface;
+    visuals.widgets.noninteractive.bg_stroke = quiet_hairline;
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, colors.text);
+
+    visuals.widgets.inactive.bg_fill = colors.surface;
+    visuals.widgets.inactive.weak_bg_fill = colors.panel;
+    visuals.widgets.inactive.bg_stroke = quiet_hairline;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, colors.text);
+
     visuals.widgets.hovered.bg_fill = colors.hover;
+    visuals.widgets.hovered.weak_bg_fill = colors.hover;
+    visuals.widgets.hovered.bg_stroke = hairline;
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, colors.text);
+
     visuals.widgets.active.bg_fill = colors.accent;
-    visuals.selection.bg_fill = colors.accent;
-    visuals.selection.stroke.color = colors.accent_text;
+    visuals.widgets.active.weak_bg_fill = colors.accent;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, colors.accent);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, colors.accent_text);
+    visuals.widgets.open = visuals.widgets.hovered;
+
+    visuals.selection.bg_fill = with_alpha(colors.accent, if dark_mode { 76 } else { 56 });
+    visuals.selection.stroke = egui::Stroke::new(1.0, colors.accent);
     visuals.hyperlink_color = colors.accent;
     visuals.override_text_color = Some(colors.text);
+    visuals.window_stroke = hairline;
+    visuals.window_shadow = window_shadow(dark_mode);
+    visuals.popup_shadow = popup_shadow(dark_mode);
+    visuals.button_frame = true;
+    visuals.collapsing_header_frame = false;
+    visuals.indent_has_left_vline = false;
+    visuals.striped = false;
+    visuals.slider_trailing_fill = true;
+    visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.42 };
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    visuals.disabled_alpha = 0.48;
 
     let mut style = egui::Style::default();
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.window_margin = egui::Margin::symmetric(14, 12);
+    style.spacing.menu_margin = egui::Margin::symmetric(10, 8);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
     style.spacing.slider_width = 170.0;
-    style.spacing.interact_size = egui::vec2(34.0, 30.0);
+    style.spacing.slider_rail_height = 4.0;
+    style.spacing.combo_width = 150.0;
+    style.spacing.text_edit_width = 220.0;
+    style.spacing.interact_size = egui::vec2(38.0, 32.0);
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 9.0;
+    style.spacing.icon_spacing = 8.0;
     apply_type_scale(&mut style);
     for radius in [
         &mut style.visuals.widgets.inactive.corner_radius,
@@ -84,34 +136,39 @@ pub fn apply_theme(ctx: &egui::Context, theme: &AlloyTheme) {
 
 pub fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let default_body_stack = fonts
+    let default_stack = fonts
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let mut heading_stack = Vec::new();
 
-    if let Some(bytes) = load_first_font(FUNNEL_SANS_FONT_CANDIDATES) {
+    let mut body_stack = Vec::new();
+    if let Some(bytes) = load_system_font() {
+        fonts
+            .font_data
+            .insert("system-ui".to_owned(), FontData::from_owned(bytes).into());
+        body_stack.push("system-ui".to_owned());
+    }
+    body_stack.extend(default_stack.clone());
+    fonts
+        .families
+        .insert(FontFamily::Proportional, body_stack.clone());
+
+    let mut heading_stack = Vec::new();
+    if !BUNDLED_FUNNEL_SANS.is_empty() {
+        fonts.font_data.insert(
+            "funnel-sans".to_owned(),
+            FontData::from_static(BUNDLED_FUNNEL_SANS).into(),
+        );
+        heading_stack.push("funnel-sans".to_owned());
+    } else if let Some(bytes) = load_first_font(FUNNEL_SANS_FONT_CANDIDATES) {
         fonts
             .font_data
             .insert("funnel-sans".to_owned(), FontData::from_owned(bytes).into());
         heading_stack.push("funnel-sans".to_owned());
     }
 
-    if let Some(bytes) = load_first_font(INTER_FONT_CANDIDATES) {
-        fonts.font_data.insert(
-            "inter-variable".to_owned(),
-            FontData::from_owned(bytes).into(),
-        );
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "inter-variable".to_owned());
-        heading_stack.push("inter-variable".to_owned());
-    }
-
-    heading_stack.extend(default_body_stack);
+    heading_stack.extend(body_stack);
     fonts.families.insert(heading_family(), heading_stack);
     ctx.set_fonts(fonts);
 }
@@ -148,19 +205,49 @@ fn load_first_font(candidates: &[&str]) -> Option<Vec<u8>> {
     candidates.iter().find_map(|path| std::fs::read(path).ok())
 }
 
-const INTER_FONT_CANDIDATES: &[&str] = &[
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/InterVariable.ttf"
-    ),
-    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Inter.ttf"),
-    "/usr/share/fonts/truetype/inter/InterVariable.ttf",
-    "/usr/share/fonts/truetype/inter/Inter.ttf",
-    "/Library/Fonts/Inter Variable.ttf",
-    "/Library/Fonts/Inter.ttf",
-    "C:\\Windows\\Fonts\\InterVariable.ttf",
-    "C:\\Windows\\Fonts\\Inter.ttf",
-];
+fn load_system_font() -> Option<Vec<u8>> {
+    load_first_font(platform_system_font_candidates()).or_else(load_fontconfig_system_font)
+}
+
+#[cfg(target_os = "linux")]
+fn load_fontconfig_system_font() -> Option<Vec<u8>> {
+    ["ui-sans-serif", "system-ui", "sans-serif"]
+        .iter()
+        .filter_map(|family| fontconfig_match(family))
+        .find(|path| use_fontconfig_body_font(path))
+        .and_then(|path| std::fs::read(path).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_fontconfig_system_font() -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn fontconfig_match(family: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", family])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(path.trim());
+    path.is_file().then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn use_fontconfig_body_font(path: &Path) -> bool {
+    let name = path.to_string_lossy().to_lowercase();
+    !["ubuntu", "dejavu", "liberation"]
+        .iter()
+        .any(|font| name.contains(font))
+}
+
+const BUNDLED_FUNNEL_SANS: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/funnel_sans_font.bin"));
 
 const FUNNEL_SANS_FONT_CANDIDATES: &[&str] = &[
     concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/FunnelSans.ttf"),
@@ -173,6 +260,105 @@ const FUNNEL_SANS_FONT_CANDIDATES: &[&str] = &[
     "/Library/Fonts/Funnel Sans.ttf",
     "C:\\Windows\\Fonts\\FunnelSans.ttf",
 ];
+
+#[cfg(target_os = "macos")]
+fn platform_system_font_candidates() -> &'static [&'static str] {
+    &[
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/SFNSDisplay.ttf",
+        "/System/Library/Fonts/Supplemental/SF Pro.ttf",
+        "/System/Library/Fonts/Supplemental/SF Pro Text.ttf",
+        "/System/Library/Fonts/Supplemental/SF Pro Display.ttf",
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn platform_system_font_candidates() -> &'static [&'static str] {
+    &[
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\segoeuisl.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn platform_system_font_candidates() -> &'static [&'static str] {
+    &[
+        "/usr/share/fonts/truetype/adwaita/AdwaitaSans-Regular.ttf",
+        "/usr/share/fonts/adwaita/AdwaitaSans-Regular.ttf",
+        "/usr/share/fonts/opentype/cantarell/Cantarell-VF.otf",
+        "/usr/share/fonts/truetype/cantarell/Cantarell-VF.otf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn platform_system_font_candidates() -> &'static [&'static str] {
+    &[]
+}
+
+fn hairline_stroke(dark_mode: bool) -> egui::Stroke {
+    egui::Stroke::new(
+        1.0,
+        if dark_mode {
+            Color32::from_white_alpha(28)
+        } else {
+            Color32::from_black_alpha(24)
+        },
+    )
+}
+
+fn quiet_hairline_stroke(dark_mode: bool) -> egui::Stroke {
+    egui::Stroke::new(
+        1.0,
+        if dark_mode {
+            Color32::from_white_alpha(16)
+        } else {
+            Color32::from_black_alpha(18)
+        },
+    )
+}
+
+fn window_shadow(dark_mode: bool) -> egui::Shadow {
+    if dark_mode {
+        egui::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(80),
+        }
+    } else {
+        egui::Shadow {
+            offset: [0, 10],
+            blur: 26,
+            spread: 0,
+            color: Color32::from_black_alpha(28),
+        }
+    }
+}
+
+fn popup_shadow(dark_mode: bool) -> egui::Shadow {
+    if dark_mode {
+        egui::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(86),
+        }
+    } else {
+        egui::Shadow {
+            offset: [0, 8],
+            blur: 22,
+            spread: 0,
+            color: Color32::from_black_alpha(34),
+        }
+    }
+}
+
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThemeColors {
@@ -387,5 +573,19 @@ mod tests {
         };
 
         assert_eq!(catalog.default_theme().definition.id, "graphite");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_body_filter_rejects_distribution_fonts() {
+        assert!(!use_fontconfig_body_font(Path::new(
+            "/usr/share/fonts/truetype/ubuntu/UbuntuSans.ttf"
+        )));
+        assert!(!use_fontconfig_body_font(Path::new(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        )));
+        assert!(use_fontconfig_body_font(Path::new(
+            "/usr/share/fonts/truetype/adwaita/AdwaitaSans-Regular.ttf"
+        )));
     }
 }

@@ -10,7 +10,7 @@ Alloy is a lightweight Rust desktop music player built around a small core API a
 - FLAC and Ogg/Opus Vorbis-comment metadata for title, artist, album, and ReplayGain tags.
 - Modular audio processing chain. The built-in ReplayGain and EQ processors are normal chain nodes, and native community processors can be ordered around them.
 - Shuffle, repeat-all, repeat-one, restart/previous transport behavior, and a bit-perfect mode that bypasses Alloy DSP and app volume.
-- JPEG/PNG sidecar album covers from files such as `cover.jpg`, `folder.png`, `front.jpg`, or an image matching the track file stem.
+- JPEG/PNG sidecar album covers from files such as `cover.jpg`, `folder.png`, `front.jpg`, or an image matching the track file stem. FLAC embedded picture blocks are used when no sidecar cover exists.
 - Built-in themes: Graphite, Linen, and Signal.
 - Optional Last.fm module for now-playing updates and scrobbling.
 - Optional Discord Rich Presence module.
@@ -39,6 +39,18 @@ You can pass a music folder or file directly:
 ```
 
 Inside the app, add folders from the native picker in the left panel or Settings, type a path manually, or drop audio files/folders onto the window.
+
+## Fonts
+
+Alloy uses Funnel Sans for heading styles when available and the platform/system UI font for normal controls and body text.
+
+To bundle Funnel Sans into the executable, place the font here:
+
+```text
+crates/alloy-app/assets/fonts/FunnelSans.ttf
+```
+
+The app build script copies that file into Cargo's build output and `include_bytes!` embeds it into the binary. If the file is absent, Alloy falls back to installed Funnel Sans and then the system font stack.
 
 ## Platform Support
 
@@ -123,7 +135,7 @@ repeat = "none"
 bit_perfect = false
 ```
 
-Bit-perfect mode is a best-effort Alloy bypass: the app disables its DSP chain and volume scaling. The final output can still be affected by the decoder, `rodio`/`cpal`, the selected output device format, or the operating-system mixer.
+Bit-perfect mode is a best-effort Alloy bypass: the app disables its DSP chain, app volume scaling, and fade ramps. The final output can still be affected by the decoder, `rodio`/`cpal`, the selected output device format, or the operating-system mixer.
 
 Album cover display is configurable:
 

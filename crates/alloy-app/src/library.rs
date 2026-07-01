@@ -10,6 +10,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["flac", "mp3", "ogg", "opus", "wav", "m4
 const COVER_STEMS: &[&str] = &["cover", "folder", "front", "album", "artwork"];
 const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
 const METADATA_READ_LIMIT: u64 = 512 * 1024;
+const COVER_READ_LIMIT: u64 = 8 * 1024 * 1024;
 
 pub struct LocalMusicSource {
     manifest: ModuleManifest,
@@ -153,8 +154,12 @@ fn read_track_metadata(path: &Path) -> TrackMetadata {
 }
 
 fn read_limited(path: &Path) -> Option<Vec<u8>> {
+    read_limited_to(path, METADATA_READ_LIMIT)
+}
+
+fn read_limited_to(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
-    let mut reader = file.take(METADATA_READ_LIMIT);
+    let mut reader = file.take(limit);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).ok()?;
     Some(bytes)
@@ -166,27 +171,82 @@ fn read_flac_vorbis_comments(path: &Path) -> Option<BTreeMap<String, String>> {
         return None;
     }
 
-    let mut offset = 4;
-    while offset + 4 <= bytes.len() {
-        let header = bytes.get(offset..offset + 4)?;
-        let block_type = header[0] & 0x7f;
-        let is_last = header[0] & 0x80 != 0;
-        let length =
-            (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
-        offset += 4;
-
-        let payload = bytes.get(offset..offset + length)?;
-        if block_type == 4 {
-            return parse_vorbis_comment_block(payload);
-        }
-
-        offset += length;
-        if is_last {
-            break;
+    for block in flac_metadata_blocks(&bytes) {
+        if block.block_type == 4 {
+            return parse_vorbis_comment_block(block.payload);
         }
     }
 
     None
+}
+
+pub fn read_embedded_cover(path: &Path) -> Option<Vec<u8>> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+    {
+        return None;
+    }
+
+    let bytes = read_limited_to(path, COVER_READ_LIMIT)?;
+    if !bytes.starts_with(b"fLaC") {
+        return None;
+    }
+
+    flac_metadata_blocks(&bytes)
+        .find(|block| block.block_type == 6)
+        .and_then(|block| parse_flac_picture(block.payload))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlacMetadataBlock<'a> {
+    block_type: u8,
+    payload: &'a [u8],
+}
+
+fn flac_metadata_blocks(bytes: &[u8]) -> impl Iterator<Item = FlacMetadataBlock<'_>> {
+    let mut offset = 4;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done || offset + 4 > bytes.len() {
+            return None;
+        }
+
+        let header = bytes.get(offset..offset + 4)?;
+        done = header[0] & 0x80 != 0;
+        let block_type = header[0] & 0x7f;
+        let length =
+            (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+        offset += 4;
+        let payload = bytes.get(offset..offset + length)?;
+        offset += length;
+
+        Some(FlacMetadataBlock {
+            block_type,
+            payload,
+        })
+    })
+}
+
+fn parse_flac_picture(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut offset = 0;
+    let _picture_type = read_be_u32(bytes, &mut offset)?;
+    let mime_length = usize::try_from(read_be_u32(bytes, &mut offset)?).ok()?;
+    let mime = std::str::from_utf8(bytes.get(offset..offset + mime_length)?).ok()?;
+    offset += mime_length;
+    if !matches!(mime, "image/jpeg" | "image/jpg" | "image/png") {
+        return None;
+    }
+
+    let description_length = usize::try_from(read_be_u32(bytes, &mut offset)?).ok()?;
+    offset = offset.checked_add(description_length)?;
+    let _width = read_be_u32(bytes, &mut offset)?;
+    let _height = read_be_u32(bytes, &mut offset)?;
+    let _depth = read_be_u32(bytes, &mut offset)?;
+    let _colors = read_be_u32(bytes, &mut offset)?;
+    let data_length = usize::try_from(read_be_u32(bytes, &mut offset)?).ok()?;
+    Some(bytes.get(offset..offset + data_length)?.to_vec())
 }
 
 fn read_ogg_vorbis_comments(path: &Path) -> Option<BTreeMap<String, String>> {
@@ -267,6 +327,12 @@ fn read_le_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
     let value = bytes.get(*offset..*offset + 4)?;
     *offset += 4;
     Some(u32::from_le_bytes(value.try_into().ok()?))
+}
+
+fn read_be_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let value = bytes.get(*offset..*offset + 4)?;
+    *offset += 4;
+    Some(u32::from_be_bytes(value.try_into().ok()?))
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -381,6 +447,14 @@ mod tests {
         assert_eq!(metadata.replay_gain.track_peak, Some(0.9412));
     }
 
+    #[test]
+    fn parses_flac_picture_block_data() {
+        let picture_bytes = [0x89, b'P', b'N', b'G'];
+        let block = flac_picture_block("image/png", &picture_bytes);
+
+        assert_eq!(parse_flac_picture(&block), Some(picture_bytes.to_vec()));
+    }
+
     fn vorbis_comment_block(comments: &[(&str, &str)]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0_u32.to_le_bytes());
@@ -390,6 +464,21 @@ mod tests {
             bytes.extend_from_slice(&(comment.len() as u32).to_le_bytes());
             bytes.extend_from_slice(comment.as_bytes());
         }
+        bytes
+    }
+
+    fn flac_picture_block(mime: &str, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3_u32.to_be_bytes());
+        bytes.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(mime.as_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&300_u32.to_be_bytes());
+        bytes.extend_from_slice(&300_u32.to_be_bytes());
+        bytes.extend_from_slice(&24_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(data);
         bytes
     }
 }

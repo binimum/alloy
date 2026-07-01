@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod config;
+mod icons;
 mod integrations;
 mod library;
 mod native_file_dialog;
